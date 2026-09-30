@@ -1,0 +1,48 @@
+{
+  "title": "华老栓：显示原文与可听替换",
+  "clips": [
+    {
+      "id": "001",
+      "role": "旁白",
+      "text": "华老栓忽然坐起身。",
+      "voice": "zh_female_vv_uranus_bigtts",
+      "direction": "自然、清楚的普通话朗读",
+      "speech_rate": 0,
+      "pause_after_ms": 0,
+      "readings": [
+        {
+          "start": 0,
+          "text": "华",
+          "pinyin": [
+            "hua4"
+          ],
+          "status": "reviewed",
+          "delivery": "spoken_alias",
+          "note": "示例：姓氏第四声，演示已授权的按位置可听替换；尚未生成音频",
+          "spoken_alias": "桦",
+          "alias_approved": true
+        },
+        {
+          "start": 2,
+          "text": "栓",
+          "pinyin": [
+            "shuan1"
+          ],
+          "status": "reviewed",
+          "delivery": "native",
+          "note": "示例：常用语境读音，仅校对展示，保留供应商自然读法"
+        },
+        {
+          "start": 7,
+          "text": "身",
+          "pinyin": [
+            "shen1"
+          ],
+          "status": "reviewed",
+          "delivery": "native",
+          "note": "示例：常用语境读音，仅校对展示，保留供应商自然读法"
+        }
+      ]
+    }
+  ]
+}

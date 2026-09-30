@@ -1,0 +1,37 @@
+{
+  "title": "中文多音字校对示例",
+  "clips": [
+    {
+      "id": "001", "role": "旁白", "text": "银行行长走过长街。\n",
+      "voice": "zh_female_vv_uranus_bigtts", "direction": "自然、清楚的普通话叙述，不逐字重读。",
+      "speech_rate": 0, "pause_after_ms": 0,
+      "readings": [
+        {"start": 0, "text": "银行", "pinyin": ["yin2", "hang2"], "status": "reviewed", "note": "金融机构，行读 háng"},
+        {"start": 2, "text": "行长", "pinyin": ["hang2", "zhang3"], "status": "reviewed", "note": "银行负责人，长读 zhǎng"},
+        {"start": 4, "text": "走过长街", "pinyin": ["zou3", "guo4", "chang2", "jie1"], "status": "reviewed", "note": "走过用 guò，街道长用 cháng"}
+      ]
+    },
+    {
+      "id": "002", "role": "旁白", "text": "重庆的音乐令人快乐。\n",
+      "voice": "zh_female_vv_uranus_bigtts", "direction": "自然、温和的普通话叙述。",
+      "speech_rate": 0, "pause_after_ms": 0,
+      "readings": [
+        {"start": 0, "text": "重庆", "pinyin": ["chong2", "qing4"], "status": "reviewed", "note": "地名，重读 chóng"},
+        {"start": 2, "text": "的", "pinyin": ["de5"], "status": "reviewed", "note": "结构助词，轻声"},
+        {"start": 3, "text": "音乐", "pinyin": ["yin1", "yue4"], "status": "reviewed", "note": "音乐的乐读 yuè"},
+        {"start": 5, "text": "令人", "pinyin": ["ling4", "ren2"], "status": "reviewed", "note": "使人，令读 lìng"},
+        {"start": 7, "text": "快乐", "pinyin": ["kuai4", "le4"], "status": "reviewed", "note": "快乐的乐读 lè"}
+      ]
+    },
+    {
+      "id": "003", "role": "旁白", "text": "单先生还要还款。\n",
+      "voice": "zh_female_vv_uranus_bigtts", "direction": "平实、清楚的普通话叙述。",
+      "speech_rate": 0, "pause_after_ms": 0,
+      "readings": [
+        {"start": 0, "text": "单先生", "pinyin": ["shan4", "xian1", "sheng5"], "status": "reviewed", "note": "示例假设姓单，读 Shàn；真实私人姓名须确认"},
+        {"start": 3, "text": "还要", "pinyin": ["hai2", "yao4"], "status": "reviewed", "note": "仍然需要，读 hái"},
+        {"start": 5, "text": "还款", "pinyin": ["huan2", "kuan3"], "status": "reviewed", "note": "归还款项，读 huán；修正词典建议"}
+      ]
+    }
+  ]
+}

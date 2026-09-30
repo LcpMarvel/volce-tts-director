@@ -1,0 +1,20 @@
+{
+  "title": "语音指令、引用上文与发音字典示例",
+  "clips": [
+    {
+      "id": "001",
+      "role": "旁白",
+      "text": "编号123。",
+      "voice": "zh_female_vv_uranus_bigtts",
+      "direction": "温和、清楚地报出编号，稍慢一些。",
+      "reference_text": "请先报一下编号。",
+      "section_id": "number-report",
+      "speech_rate": -10,
+      "pause_after_ms": 0,
+      "pronunciation_dict": {"tone": ["123/一百二十三"]},
+      "readings": [
+        {"start": 1, "text": "号", "pinyin": ["hao4"], "status": "reviewed", "delivery": "native", "note": "编号的号读 hào；上文与控制字段均为演示，尚未合成音频"}
+      ]
+    }
+  ]
+}
