@@ -40,7 +40,7 @@ uv run scripts/tts.py render --plan plan.json --out 音频
 
 上面仅演示字段；实际候选以扫描结果为准。标注可覆盖单字或词组，不能重叠。每个词组最多 9 个汉字，每个字一个拼音。替换词组标注时删除已覆盖的单字标注。请求采用官方 `additions` JSON 字符串里的 `pronunciation_dict.tone`，例如 `银行/(yin2)(hang2)`；同词规则去重，并模拟贪心最长匹配，验证每个已校对位置实际得到指定读音。显示注音不改变 `req_params.text`；已授权的客户端可听别名除外。
 
-只允许官方固定端点 `https://openspeech.bytedance.com/api/v3/tts/unidirectional` 和 `seed-tts-2.0`，不隐式代理到其他供应商。预置音色以用户控制台权限为准；脚本检查中文音色 ID，但离线检查不能证明账号权限或中文发音效果。
+只允许官方固定端点 `https://openspeech.bytedance.com/api/v3/tts/unidirectional`，资源限定 `seed-tts-2.0`（`zh_` 预置音色）和 `seed-icl-2.0`（`S_` 已有克隆音色），不隐式代理到其他供应商。可用音色以用户控制台权限为准；离线检查只验证 ID 格式和本工具的资源组合，不能证明账号权限、训练状态或中文发音效果。
 
 `speech_rate` 为整数 -50～100（0 为正常）；`pause_after_ms` 为本地拼接停顿，0～30000 毫秒；`direction` 写中文导演说明。请求输出 24kHz 单声道 PCM，使用 Python 标准库包装成 WAV、顺序拼接，无需 ffmpeg。正式调用保存无凭据的请求、请求 ID、服务端 logid、用量与耗时。字幕未实现，不虚构时间戳。
 
@@ -55,6 +55,23 @@ uv run --with pypinyin==0.55.0 python tests/selfcheck.py
 ```
 
 协议依据（2026-09-30 核对）：[火山官方 HTTP 接口](https://docs.volcengine.com/docs/DoubaoVoice/unidirectional-streaming-text-to-speech-http?lang=zh)；候选词典行为：[pypinyin 官方文档](https://github.com/mozillazg/python-pinyin/blob/master/docs/usage.rst)。本工具不保证词典完整或模型遵循指令，正式生成后仍需试听多音字所在句。
+
+## 已有克隆音色
+
+本工具支持使用已训练完成且账号有权限的**声音复刻 2.0** 音色合成，不提供录音上传、音色训练、升级或旧代际接口。`S_` 前缀只用于识别克隆 ID 格式，不能据此断言训练代际；本工具默认选择 `seed-icl-2.0`，不自动试其他收费资源。
+
+```sh
+uv run scripts/tts.py prepare --text-file 原稿.txt --voice S_xWSg2NNT1 --resource-id seed-icl-2.0 --out plan.json
+# 完成 readings 语境校对后，按常规 preview → dry-run → 已授权 render 流程执行
+```
+
+`--resource-id` 可省略：`zh_` 默认 `seed-tts-2.0`，`S_` 默认 `seed-icl-2.0`。每段可在计划中显式填写 `resource_id`，音色/资源错配或未知资源在联网前拒绝。克隆草稿写入所选资源并将 `direction` 留空，不自动假设支持普通话风格或语音指令；用户明确设置的控制字段不会静默删除。指令、上文、字典、方言的效果仍依具体训练版本和音色能力验证。
+
+阅读稿展示资源；dry-run 的 JSON 结果和 `routes.json` 包含逐片段 `clip`、`speaker`、`resource_id` 与固定 `endpoint`，不包含密钥；`requests.json` 保持请求体数组格式。dry-run 不联网、不读取密钥，但会写本地检查文件，不能证明音色已训练或账号有权限。正式请求使用 `X-Api-Resource-Id` 选择资源，不使用旧版 `cluster`。
+
+克隆缓存绑定端点、资源及请求体。预置资源保持原有请求体指纹，旧完成缓存继续复用，旧 `uncertain` 仍阻止重发；显式填写相同默认资源不会触发重复合成。若发现来源不明、未绑定资源的旧克隆记录，停止并要求核对，不错误复用或重新扣费。
+
+首次用新克隆音色时先试听一段短中文。权限、训练代际或网络出错时保留实际状态，不自动重试、切换资源或训练。成功与否以服务返回和 manifest 为准，实际演绎和相似度须试听，不能用结构检查代替。
 
 ## 语音指令与引用上文
 
@@ -87,7 +104,7 @@ uv run --with pypinyin==0.55.0 python tests/selfcheck.py
 
 ## 段落标识 section_id
 
-在片段设置 `"section_id": "opening"` 后，脚本传入 `additions.section_id`。省略或空字符串时不传。依据官方文档，该参数为字符串，用于配置段落标识、保持跨包语义，适用于语音合成 2.0 和声音复刻 2.0；本工具仍只使用中文预置音色。
+在片段设置 `"section_id": "opening"` 后，脚本传入 `additions.section_id`。省略或空字符串时不传。依据官方文档，该参数为字符串，用于配置段落标识、保持跨包语义，适用于语音合成 2.0 和声音复刻 2.0；本工具可用于预置与已有克隆音色，实际效果须验证。
 
 连续段落被拆成多个合成片段时可以沿用同一标识；场景切换时换标识。它不是引用上文的替代，不把段落标识当作服务端跨请求记忆、音色一致性或连贯性的保证。阅读稿显示标识，缓存绑定真实字段；账号效果仍需实际验收。
 

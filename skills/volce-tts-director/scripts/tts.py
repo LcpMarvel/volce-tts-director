@@ -187,6 +187,28 @@ def readings(clip, complete=False):
     return rows, rules
 
 
+def resolve_resource(clip):
+    voice = clip["voice"]
+    if isinstance(voice, str) and re.fullmatch(r"zh_[a-zA-Z0-9_]+", voice):
+        expected = "seed-tts-2.0"
+    elif isinstance(voice, str) and re.fullmatch(r"S_[a-zA-Z0-9]+", voice):
+        # S_ 不代表训练代际；本工具只接复刻 2.0，不自动探测其他资源。
+        expected = "seed-icl-2.0"
+    else:
+        raise ValueError("需要中文预置音色 ID（zh_）或已有克隆音色 ID（S_）")
+    resource = clip.get("resource_id", expected)
+    if not isinstance(resource, str) or resource != expected:
+        raise ValueError(f"音色 {voice} 在本工具中需要 resource_id={expected}")
+    return resource
+
+
+def request_fingerprint(body, resource):
+    # 预置资源保留旧指纹，避免丢失完成缓存或绕过 uncertain。
+    value = body if resource == "seed-tts-2.0" else {
+        "endpoint": ENDPOINT, "resource_id": resource, "body": body}
+    return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
 def validate(plan, complete=False):
     clips = plan.get("clips")
     if not isinstance(clips, list) or not clips:
@@ -200,8 +222,7 @@ def validate(plan, complete=False):
         check_text(clip["text"])
         if len(clip["text"]) > 500:
             raise ValueError("单段本地上限 500 字；请明确分段，不截断")
-        if not isinstance(clip["voice"], str) or not re.fullmatch(r"zh_[a-zA-Z0-9_]+", clip["voice"]):
-            raise ValueError("需要中文预置音色 ID")
+        resolve_resource(clip)
         for name, low, high in (("speech_rate", -50, 100), ("pause_after_ms", 0, 30000)):
             value = clip.get(name, 0)
             if type(value) is not int or not low <= value <= high:
@@ -221,7 +242,11 @@ def validate(plan, complete=False):
         readings(clip, complete)
 
 
-def prepare(text, voice=VOICE):
+def prepare(text, voice=VOICE, resource_id=None):
+    selection = {"voice": voice}
+    if resource_id is not None:
+        selection["resource_id"] = resource_id
+    resource = resolve_resource(selection)
     check_text(text)
     # ponytail: 500 字保守本地上限；需要更长连续朗读时核实账号与模型限制后调整。
     parts, current = [], ""
@@ -236,10 +261,14 @@ def prepare(text, voice=VOICE):
         parts.append(current)
     if "".join(parts) != text:
         raise ValueError("分段未保留完整原文")
-    return {"title": "中文阅读", "clips": [
-        {"id": f"{i:03}", "role": "旁白", "text": part, "voice": voice,
-         "direction": "自然、清楚的普通话朗读", "reference_text": "", "speech_rate": 0,
-         "pause_after_ms": 0, "readings": scan(part)} for i, part in enumerate(parts, 1)]}
+    clips = [{"id": f"{i:03}", "role": "旁白", "text": part, "voice": voice,
+              "direction": "自然、清楚的普通话朗读" if resource == "seed-tts-2.0" else "",
+              "reference_text": "", "speech_rate": 0,
+              "pause_after_ms": 0, "readings": scan(part)} for i, part in enumerate(parts, 1)]
+    if resource_id is not None or resource == "seed-icl-2.0":
+        for clip in clips:
+            clip["resource_id"] = resource
+    return {"title": "中文阅读", "clips": clips}
 
 
 def preview(plan, out):
@@ -277,7 +306,8 @@ def preview(plan, out):
         markup.append(html.escape(clip["text"][cursor:]))
         plain.append(clip["text"][cursor:])
         label = f'{clip["id"]} · {clip.get("role", "旁白")} · {clip["voice"]}'
-        controls = [("语音指令", clip.get("direction", "")),
+        controls = [("合成资源", resolve_resource(clip)),
+                    ("语音指令", clip.get("direction", "")),
                     ("引用上文（只引用，不朗读）", clip.get("reference_text", "")),
                     ("语速参数", str(clip.get("speech_rate", 0))),
                     ("方言", DIALECTS.get(clip.get("explicit_dialect", ""), "随音色默认")),
@@ -367,22 +397,28 @@ def wav_bytes(pcm):
 
 def render(plan, out, dry_run=False, retry_uncertain=False):
     validate(plan, complete=True)
-    jobs = [(clip, request_body(clip)) for clip in plan["clips"]]
+    jobs = [(clip, request_body(clip), resolve_resource(clip)) for clip in plan["clips"]]
+    routes = [{"clip": clip["id"], "speaker": clip["voice"], "resource_id": resource,
+               "endpoint": ENDPOINT} for clip, _, resource in jobs]
     out.mkdir(parents=True, exist_ok=True)
-    save(out / "requests.json", [body for _, body in jobs])
+    save(out / "requests.json", [body for _, body, _ in jobs])
+    save(out / "routes.json", routes)
     if dry_run:
-        return {"dry_run": True, "clips": len(jobs), "characters": sum(len(c["text"]) for c, _ in jobs)}
+        return {"dry_run": True, "clips": len(jobs),
+                "characters": sum(len(c["text"]) for c, _, _ in jobs), "routes": routes}
     key = os.environ.get("VOLC_TTS_API_KEY")
     if not key:
         raise ValueError("运行环境缺少 VOLC_TTS_API_KEY")
     manifest_path = out / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
-    fingerprints = [hashlib.sha256(json.dumps(body, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
-                    for _, body in jobs]
+    fingerprints = [request_fingerprint(body, resource) for _, body, resource in jobs]
+    for _, body, resource in jobs:
+        if resource != "seed-tts-2.0" and request_fingerprint(body, "seed-tts-2.0") in manifest:
+            raise RuntimeError("已有未绑定资源的旧克隆请求记录；请先核对服务记录，不自动复用或重发")
     if not retry_uncertain and any(manifest.get(f, {}).get("status") == "uncertain" for f in fingerprints):
         raise RuntimeError("已有结果不确定的请求；核对服务记录与授权后才能 --retry-uncertain")
     pcm_all = bytearray()
-    for (clip, body), fingerprint in zip(jobs, fingerprints):
+    for (clip, body, resource), fingerprint in zip(jobs, fingerprints):
         audio_path = out / (fingerprint + ".wav")
         entry = manifest.get(fingerprint, {})
         if entry.get("status") == "complete":
@@ -394,12 +430,13 @@ def render(plan, out, dry_run=False, retry_uncertain=False):
                     raise ValueError("缓存音频为空")
         else:
             request_id = str(uuid.uuid4())
-            entry = {"status": "uncertain", "request_id": request_id, "clip": clip["id"]}
+            entry = {"status": "uncertain", "request_id": request_id, "clip": clip["id"],
+                     "resource_id": resource, "endpoint": ENDPOINT}
             manifest[fingerprint] = entry
             save(manifest_path, manifest)
             request = urllib.request.Request(ENDPOINT, data=json.dumps(body, ensure_ascii=False).encode(),
                 headers={"Content-Type": "application/json", "X-Api-Key": key,
-                         "X-Api-Resource-Id": "seed-tts-2.0", "X-Api-Request-Id": request_id}, method="POST")
+                         "X-Api-Resource-Id": resource, "X-Api-Request-Id": request_id}, method="POST")
             started = time.monotonic()
             try:
                 # 不跟随重定向，避免凭据转发到另一目的地。
@@ -436,6 +473,7 @@ def main():
     prep = sub.add_parser("prepare")
     prep.add_argument("--text-file", type=Path, required=True)
     prep.add_argument("--voice", default=VOICE)
+    prep.add_argument("--resource-id", choices=("seed-tts-2.0", "seed-icl-2.0"))
     prep.add_argument("--out", type=Path, required=True)
     for command in ("preview", "render"):
         cmd = sub.add_parser(command)
@@ -447,7 +485,7 @@ def main():
     args = parser.parse_args()
     try:
         if args.command == "prepare":
-            plan = prepare(args.text_file.read_text(encoding="utf-8"), args.voice)
+            plan = prepare(args.text_file.read_text(encoding="utf-8"), args.voice, args.resource_id)
             validate(plan)
             save(args.out, plan)
             result = {"plan": str(args.out.resolve())}

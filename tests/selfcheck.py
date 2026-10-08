@@ -1,11 +1,13 @@
 """本地验收：真实中文校对 + 请求接线 + 模拟音频；零 TTS 调用。"""
 import base64
 import copy
+import hashlib
 import importlib.util
 import io
 import json
 import os
 import tempfile
+import uuid
 import wave
 from pathlib import Path
 from unittest.mock import patch
@@ -22,6 +24,106 @@ def fails(call, message):
     except (ValueError, RuntimeError):
         return
     raise AssertionError(message)
+
+
+def clone_checks(plan, frames, pcm):
+    clone = copy.deepcopy(plan)
+    clone["clips"] = clone["clips"][:1]
+    clip = clone["clips"][0]
+    clip.update(voice="S_xWSg2NNT1", direction="")
+    tts.validate(clone, True)
+    assert tts.resolve_resource(clip) == "seed-icl-2.0"
+    body = tts.request_body(clip)
+    assert body["req_params"]["speaker"] == "S_xWSg2NNT1"
+    assert isinstance(body["req_params"]["additions"], str)
+    assert "context_texts" not in json.loads(body["req_params"]["additions"])
+    draft = tts.prepare("你好。", voice=clip["voice"])
+    assert draft["clips"][0]["resource_id"] == "seed-icl-2.0"
+    assert draft["clips"][0]["direction"] == ""
+    assert tts.prepare("你好。", clip["voice"], "seed-icl-2.0") == draft
+    assert tts.prepare("你好。")["clips"][0]["direction"] == "自然、清楚的普通话朗读"
+    for voice in ("S_", "S_xWSg2NNT1/", "S_x WSg2NNT1", "en_voice", "", None, 123):
+        bad = copy.deepcopy(clone)
+        bad["clips"][0]["voice"] = voice
+        fails(lambda: tts.validate(bad), "拒绝非法音色")
+    for resource in ("seed-tts-2.0", "seed-icl-1.0", "", None, []):
+        bad = copy.deepcopy(clone)
+        bad["clips"][0]["resource_id"] = resource
+        fails(lambda: tts.validate(bad), "拒绝克隆资源错配或未知代际")
+    fails(lambda: tts.prepare("你好。", resource_id="seed-icl-2.0"), "拒绝预置资源错配")
+    expected = ["seed-tts-2.0", "seed-icl-2.0"]
+    mixed = {"clips": [copy.deepcopy(plan["clips"][0]), copy.deepcopy(clip)]}
+    mixed["clips"][1]["id"] = "clone"
+    seen = []
+    class Response(io.BytesIO):
+        headers = {"X-Tt-Logid": "offline-clone"}
+    class Opener:
+        def open(self, request, timeout):
+            resource = request.get_header("X-api-resource-id")
+            sent = json.loads(request.data)["req_params"]
+            assert resource == ("seed-icl-2.0" if sent["speaker"].startswith("S_") else "seed-tts-2.0")
+            assert request.get_header("X-api-key") == "offline-fake-key"
+            assert request.full_url == tts.ENDPOINT and request.method == "POST"
+            assert str(uuid.UUID(request.get_header("X-api-request-id"))) == request.get_header("X-api-request-id")
+            seen.append(resource)
+            return Response(b"\n".join(frames))
+    with tempfile.TemporaryDirectory(prefix="volce-clone-check-") as directory:
+        out = Path(directory)
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+                tts.urllib.request, "build_opener", side_effect=AssertionError("dry-run 不能联网")):
+            summary = tts.render(mixed, out / "audio", dry_run=True)
+            assert [r["resource_id"] for r in summary["routes"]] == expected
+            assert summary["routes"][1]["speaker"] == clip["voice"]
+            saved = json.loads((out / "audio/requests.json").read_text())
+            assert saved == [tts.request_body(c) for c in mixed["clips"]]
+            assert json.loads((out / "audio/routes.json").read_text()) == summary["routes"]
+            fails(lambda: tts.render(clone, out / "missing-key"), "真实合成必须有密钥")
+        tts.preview(clone, out / "preview")
+        assert "seed-icl-2.0" in (out / "preview/director.html").read_text()
+        preset_body = tts.request_body(mixed["clips"][0])
+        legacy = hashlib.sha256(json.dumps(preset_body, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+        assert tts.request_fingerprint(preset_body, "seed-tts-2.0") == legacy
+        legacy_out = out / "legacy"
+        tts.save(legacy_out / "manifest.json", {legacy: {"status": "complete"}})
+        (legacy_out / (legacy + ".wav")).write_bytes(tts.wav_bytes(pcm))
+        preset = {"clips": [copy.deepcopy(mixed["clips"][0])]}
+        with patch.dict(os.environ, {"VOLC_TTS_API_KEY": "offline-fake-key"}), patch.object(
+                tts.urllib.request, "build_opener", return_value=Opener()) as network:
+            tts.render(preset, legacy_out)
+            preset["clips"][0]["resource_id"] = "seed-tts-2.0"
+            tts.render(preset, legacy_out)
+            assert network.call_count == 0, "显式默认资源与旧缓存兼容"
+            tts.render(mixed, out / "audio")
+            assert seen == expected and network.call_count == 2
+            explicit = copy.deepcopy(mixed)
+            explicit["clips"][1]["resource_id"] = "seed-icl-2.0"
+            explicit["clips"][1]["pause_after_ms"] = 500
+            tts.render(explicit, out / "audio")
+            assert network.call_count == 2, "克隆默认/显式资源、停顿调整复用缓存"
+            assert tts.request_fingerprint(body, "seed-icl-2.0") != tts.request_fingerprint(body, "seed-tts-2.0")
+            tts.save(out / "blocked/manifest.json", {legacy: {"status": "uncertain"}})
+            fails(lambda: tts.render({"clips": list(reversed(mixed["clips"]))}, out / "blocked"),
+                  "旧 uncertain 必须在任何新调用前阻断")
+            assert network.call_count == 2
+            for status in ("complete", "uncertain"):
+                clone_legacy = tts.request_fingerprint(body, "seed-tts-2.0")
+                tts.save(out / "ambiguous/manifest.json", {clone_legacy: {"status": status}})
+                fails(lambda: tts.render(clone, out / "ambiguous", retry_uncertain=True),
+                      "来源不明的旧克隆记录不能复用或静默绕过")
+            assert network.call_count == 2
+            changed = copy.deepcopy(mixed)
+            changed["clips"][1]["direction"] = "轻声叙述。"
+            tts.render(changed, out / "audio")
+            assert network.call_count == 3, "只重做克隆音色受影响段"
+            broken = out / "broken"
+            with patch.object(tts.urllib.request, "build_opener", side_effect=OSError("模拟断网")):
+                fails(lambda: tts.render(clone, broken), "克隆断网也要停止")
+            fails(lambda: tts.render(clone, broken), "克隆 uncertain 不自动重发")
+            assert network.call_count == 3
+            entries = json.loads((broken / "manifest.json").read_text())
+            assert all(e["status"] == "uncertain" and e["resource_id"] == "seed-icl-2.0" for e in entries.values())
+        assert all("offline-fake-key" not in f.read_text() for f in out.rglob("*.json"))
+        assert tts.NoRedirect().redirect_request(None, None, 302, "", {}, "https://example.com") is None
 
 
 def demo():
@@ -145,6 +247,7 @@ def demo():
         def open(self, request, timeout):
             assert request.full_url == tts.ENDPOINT
             assert request.get_header("X-api-key") == "offline-fake-key"
+            assert request.get_header("X-api-resource-id") == "seed-tts-2.0"
             assert json.loads(request.data)["req_params"]["text"] in text
             return Response(b"\n".join(frames))
     with tempfile.TemporaryDirectory(prefix="volce-check-") as directory:
@@ -188,7 +291,8 @@ def demo():
             assert network.call_count == before
         assert "offline-fake-key" not in (out / "audio/manifest.json").read_text()
         assert "offline-fake-key" not in (out / "audio/requests.json").read_text()
-    print("PASS：中文校对、原文保留、纠音冲突、语音指令与引用上文、方言、断流、预览、请求接线、WAV与缓存")
+    clone_checks(plan, frames, pcm)
+    print("PASS：中文校对、原文保留、纠音冲突、语音指令与引用上文、方言、断流、预览、预置/克隆资源接线、WAV与新旧缓存")
 
 
 if __name__ == "__main__":
