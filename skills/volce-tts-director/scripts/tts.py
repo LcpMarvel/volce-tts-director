@@ -10,6 +10,7 @@ import hashlib
 import html
 import io
 import json
+import math
 import os
 import re
 import sys
@@ -26,6 +27,7 @@ from pypinyin.constants import PINYIN_DICT
 
 ENDPOINT = "https://openspeech.bytedance.com/api/v3/tts/unidirectional"
 VOICE = "zh_female_vv_uranus_bigtts"
+PCM_CHUNK_FRAMES = 24000
 DIALECTS = {"beijing": "北京话", "dongbei": "东北话", "henan": "河南话", "shaanxi": "陕西话",
             "shanghai": "上海话", "sichuan": "四川话", "tianjin": "天津话", "yue": "粤语"}
 HAN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U000323af]")
@@ -203,13 +205,15 @@ def resolve_resource(clip):
 
 
 def request_fingerprint(body, resource):
-    # 预置资源保留旧指纹，避免丢失完成缓存或绕过 uncertain。
+    # 字幕开关属于请求体，参与指纹；克隆请求额外绑定端点与资源。
     value = body if resource == "seed-tts-2.0" else {
         "endpoint": ENDPOINT, "resource_id": resource, "body": body}
     return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 
 def validate(plan, complete=False):
+    if "enable_subtitle" in plan and type(plan["enable_subtitle"]) is not bool:
+        raise ValueError("enable_subtitle 必须为布尔值")
     clips = plan.get("clips")
     if not isinstance(clips, list) or not clips:
         raise ValueError("计划需要非空 clips")
@@ -239,6 +243,9 @@ def validate(plan, complete=False):
             raise ValueError("explicit_dialect 必须为空或官方支持的方言代码")
         if not isinstance(clip.get("section_id", ""), str):
             raise ValueError("section_id 必须为字符串")
+        for name in ("enable_subtitle", "enable_latex_tn"):
+            if name in clip and type(clip[name]) is not bool:
+                raise ValueError(f"{name} 必须为布尔值")
         readings(clip, complete)
 
 
@@ -330,7 +337,13 @@ def preview(plan, out):
     (out / "director.html").write_text(page, encoding="utf-8")
 
 
-def request_body(clip):
+def request_body(clip, enable_subtitle=None):
+    if enable_subtitle is None:
+        enable_subtitle = clip.get("enable_subtitle", True)
+    if type(enable_subtitle) is not bool:
+        raise ValueError("enable_subtitle 必须为布尔值")
+    # 官方不支持方言及 LaTeX 文本规范化请求的字幕，保留音频合成并降级。
+    enable_subtitle = enable_subtitle and not clip.get("explicit_dialect") and not clip.get("enable_latex_tn", False)
     rows, rules = readings(clip, complete=True)
     text, instructions = list(clip["text"]), []
     additions = {"disable_markdown_filter": True}
@@ -347,6 +360,8 @@ def request_body(clip):
         additions["explicit_dialect"] = clip["explicit_dialect"]
     if clip.get("section_id"):
         additions["section_id"] = clip["section_id"]
+    if "enable_latex_tn" in clip:
+        additions["enable_latex_tn"] = clip["enable_latex_tn"]
     for row in rows:
         delivery = row.get("delivery", "spoken_alias" if "spoken_alias" in row else "dictionary")
         if delivery == "spoken_alias":
@@ -360,16 +375,36 @@ def request_body(clip):
         additions["context_texts"] = ["\n".join(instructions)]
     return {"req_params": {"text": "".join(text), "speaker": clip["voice"],
             "audio_params": {"format": "pcm", "sample_rate": 24000,
-                             "speech_rate": clip.get("speech_rate", 0)},
+                             "speech_rate": clip.get("speech_rate", 0),
+                             "enable_subtitle": enable_subtitle},
             "additions": json.dumps(additions, ensure_ascii=False)}}
 
 
-def decode_stream(lines):
-    audio, usage, finished = bytearray(), None, False
+def debug_frame(frame, secret):
+    def redact(value):
+        if isinstance(value, dict):
+            return {redact(name): ("[REDACTED]" if re.search(
+                r"key|token|authorization|secret|cookie|password", name, re.I) else redact(item))
+                for name, item in value.items()}
+        if isinstance(value, list):
+            return [redact(item) for item in value]
+        if isinstance(value, str):
+            return value.replace(secret, "[REDACTED]") if secret else value
+        return value
+    safe = dict(frame)
+    if isinstance(safe.get("data"), str):
+        safe["data"] = f"[base64: {len(safe['data'])} characters]"
+    print("stream_frame: " + json.dumps(redact(safe), ensure_ascii=False), file=sys.stderr)
+
+
+def decode_stream(lines, debug=None):
+    audio, usage, subtitles, finished = bytearray(), None, [], False
     for line in lines:
         if not line.strip():
             continue
         frame = json.loads(line)
+        if debug is not None:
+            debug(frame)
         code = frame.get("code")
         if code not in (0, 20000000):
             raise RuntimeError(f"火山返回错误码 {code}")
@@ -377,12 +412,295 @@ def decode_stream(lines):
             audio.extend(base64.b64decode(frame["data"], validate=True))
         if frame.get("usage") is not None:
             usage = frame["usage"]
+        # HTTP JSON 行使用 sentence 对象，不是 WebSocket 的字幕事件封装。
+        if isinstance(frame.get("sentence"), dict):
+            subtitles.append(frame["sentence"])
         if code == 20000000:
             finished = True
-            break
+        # 读到响应 EOF；不在最后一个音频包或完成码处丢弃晚到的字幕。
     if not finished or not audio or len(audio) % 2:
         raise RuntimeError("音频流未完整结束或 PCM 数据无效")
-    return bytes(audio), usage
+    return bytes(audio), usage, subtitles
+
+
+def finite_number(value):
+    if type(value) not in (int, float):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
+
+
+def valid_subtitle_span(start, end, duration=None):
+    if not finite_number(start) or not finite_number(end):
+        return False
+    # 服务端时间有毫秒量化，容许 10ms 舍入误差，但不裁剪或猜测时间。
+    return 0 <= start <= end and (duration is None or end <= duration + 0.01)
+
+
+def normalize_words(raw_words, duration=None):
+    if not isinstance(raw_words, list):
+        raise ValueError("字幕字词列表无效")
+    unique = {}
+    for raw in raw_words:
+        if not isinstance(raw, dict) or not isinstance(raw.get("word"), str) or not raw["word"].strip():
+            raise ValueError("字幕字词无效")
+        start, end = raw.get("startTime"), raw.get("endTime")
+        if not valid_subtitle_span(start, end, duration):
+            raise ValueError("字幕时间无效或超过音频时长")
+        if "confidence" in raw and (not finite_number(raw["confidence"]) or not 0 <= raw["confidence"] <= 1):
+            raise ValueError("字幕置信度无效")
+        unique[(raw["word"], start, end)] = {
+            name: raw[name] for name in ("word", "startTime", "endTime", "confidence") if name in raw}
+    words = sorted(unique.values(), key=lambda w: (w["startTime"], w["endTime"]))
+    if any(a["endTime"] > b["endTime"] for a, b in zip(words, words[1:])):
+        raise ValueError("字幕结束时间不单调")
+    return words
+
+
+def lexical_text(text):
+    return "".join(char for char in text if char.isalnum())
+
+
+def align_word_spans(text, words):
+    positions = [i for i, char in enumerate(text) if char.isalnum()]
+    lexical = lexical_text(text)
+    spans, cursor = [], 0
+    for word in words:
+        token = word["word"]
+        start = text.find(token, cursor)
+        if start >= 0:
+            end = start + len(token)
+        elif lexical_text(token):
+            offset = next((i for i, pos in enumerate(positions) if pos >= cursor), len(positions))
+            match = lexical.find(lexical_text(token), offset)
+            if match < 0:
+                spans.append(None)
+                continue
+            start, end = positions[match], positions[match + len(lexical_text(token)) - 1] + 1
+        else:
+            # 句末标点修订可沿用同一字词时间，但不能把文字内容也当作标点忽略。
+            start = next((i for i in range(cursor, len(text))
+                          if not text[i].isalnum() and not text[i].isspace()), -1)
+            if start < 0:
+                spans.append(None)
+                continue
+            end = start + 1
+        spans.append((start, end))
+        cursor = end
+    return spans
+
+
+def sentence_cues(text, words):
+    if not words:
+        return []
+    spans = align_word_spans(text, words)
+    boundaries = [0] + [part.end() for part in re.finditer(
+        r'.+?(?:[。！？]+["”’」』）】]*|\n+|$)', text, re.S)]
+    if boundaries[-1] != len(text):
+        boundaries.append(len(text))
+    # 未对齐的规范化字词只用相邻真实文字锚点定位；跨界或无锚点则合并字幕。
+    for i, span in enumerate(spans):
+        if span is None:
+            left = next((spans[j][1] for j in range(i - 1, -1, -1) if spans[j] is not None), 0)
+            right = next((spans[j][0] for j in range(i + 1, len(spans)) if spans[j] is not None), len(text))
+            if left >= right:
+                return [{"text": text, "startTime": words[0]["startTime"], "endTime": words[-1]["endTime"]}]
+            span = (left, right)
+        boundaries = [cut for cut in boundaries if not span[0] < cut < span[1]]
+    groups, prefix = [], ""
+    for start, end in zip(boundaries, boundaries[1:]):
+        owned = []
+        for i, span in enumerate(spans):
+            if span is None:
+                left = next((spans[j][1] for j in range(i - 1, -1, -1) if spans[j] is not None), 0)
+                right = next((spans[j][0] for j in range(i + 1, len(spans)) if spans[j] is not None), len(text))
+                span = (left, right)
+            if span[0] < end and span[1] > start:
+                owned.append(i)
+        caption = text[start:end].strip()
+        if owned:
+            groups.append({"text": prefix + caption, "indices": owned})
+            prefix = ""
+        elif groups:
+            groups[-1]["text"] += caption
+        else:
+            prefix += caption
+    for i in range(len(groups) - 1, -1, -1):
+        group = groups[i]
+        first, last = words[group["indices"][0]], words[group["indices"][-1]]
+        if first["startTime"] == last["endTime"] and not lexical_text(group["text"]):
+            if i and words[groups[i - 1]["indices"][-1]]["endTime"] == first["startTime"]:
+                groups[i - 1]["text"] += group["text"]
+                groups[i - 1]["indices"].extend(group["indices"])
+                groups.pop(i)
+            elif i + 1 < len(groups) and words[groups[i + 1]["indices"][0]]["startTime"] == last["endTime"]:
+                groups[i + 1]["text"] = group["text"] + groups[i + 1]["text"]
+                groups[i + 1]["indices"] = group["indices"] + groups[i + 1]["indices"]
+                groups.pop(i)
+    return [{"text": group["text"], "startTime": words[group["indices"][0]]["startTime"],
+             "endTime": words[group["indices"][-1]]["endTime"]} for group in groups]
+
+
+def validate_cues(data, duration=None):
+    cues, words = data["sentences"], data["words"]
+    if not isinstance(cues, list) or not isinstance(data["text"], str):
+        raise ValueError("字幕句子列表或文字无效")
+    previous = 0
+    for cue in cues:
+        if not isinstance(cue, dict) or not isinstance(cue.get("text"), str) or not cue["text"].strip():
+            raise ValueError("字幕句子文字无效")
+        start, end = cue.get("startTime"), cue.get("endTime")
+        if not valid_subtitle_span(start, end, duration) or start >= end or start < previous:
+            raise ValueError("字幕句子时间无效")
+        previous = end
+    compact = lambda value: re.sub(r"\s+", "", value)
+    if compact(data["text"]) != "".join(compact(cue["text"]) for cue in cues) and words:
+        raise ValueError("字幕句子未覆盖文字")
+    if not words:
+        if cues:
+            raise ValueError("空字词字幕不能包含句子")
+        return
+    # 字词成员由文字区间和有序索引确定；共享时间边界不等于共享字词。
+    positions = [i for i, char in enumerate(data["text"]) if not char.isspace()]
+    owners, cursor = {}, 0
+    spans = align_word_spans(data["text"], words)
+    for index, cue in enumerate(cues):
+        length = len(compact(cue["text"]))
+        left, right = positions[cursor], positions[cursor + length - 1] + 1
+        for i, span in enumerate(spans):
+            if span is not None and span[0] < right and span[1] > left:
+                if i in owners:
+                    raise ValueError("字幕句界切开了同一字词")
+                owners[i] = index
+        cursor += length
+    # 规范化文字不能逐字匹配时，只接受唯一的连续真实首尾时间分区。
+    partitions = {0: [()]}
+    for index, cue in enumerate(cues):
+        next_partitions = {}
+        expected = [i for i, owner in owners.items() if owner == index]
+        for first, paths in partitions.items():
+            if first == len(words) or words[first]["startTime"] != cue["startTime"]:
+                continue
+            for last in range(first, len(words)):
+                word = words[last]
+                if word["startTime"] < cue["startTime"] or word["endTime"] > cue["endTime"]:
+                    break
+                if word["endTime"] != cue["endTime"]:
+                    continue
+                if expected and not first <= min(expected) <= max(expected) <= last:
+                    continue
+                if any(owners.get(i, index) != index for i in range(first, last + 1)):
+                    continue
+                candidates = next_partitions.setdefault(last + 1, [])
+                candidates.extend(path + ((first, last + 1),) for path in paths)
+                del candidates[2:]
+        partitions = next_partitions
+    if len(partitions.get(len(words), [])) != 1:
+        raise ValueError("字幕句子与字词文字或时间归属不一致")
+
+
+def normalize_cached_subtitles(cached, duration):
+    if not isinstance(cached, dict) or not isinstance(cached.get("text"), str) or "words" not in cached:
+        raise ValueError("字幕缓存缺少 text 或 words")
+    words = normalize_words(cached["words"], duration)
+    data = {"text": cached["text"], "words": words,
+            "sentences": cached["sentences"] if "sentences" in cached else sentence_cues(cached["text"], words)}
+    validate_cues(data, duration)
+    data["sentences"] = [{name: cue[name] for name in ("text", "startTime", "endTime")}
+                         for cue in data["sentences"]]
+    return data
+
+
+def subtitle_data(events, text, duration=None):
+    groups = []
+    for event in events:
+        if not isinstance(event, dict) or not isinstance(event.get("text", ""), str):
+            raise ValueError("字幕格式无效")
+        local = normalize_words(event.get("words", []), duration)
+        if not local:
+            continue
+        start, end = local[0]["startTime"], local[-1]["endTime"]
+        overlapping = [group for group in groups if
+                       (group["words"][0]["startTime"] < end and start < group["words"][-1]["endTime"])
+                       or (start == end == group["words"][0]["startTime"] == group["words"][-1]["endTime"])]
+        overlapping.sort(key=lambda group: group["words"][0]["startTime"])
+        if overlapping:
+            old = [word for group in overlapping for word in group["words"]]
+            old_text = lexical_text("".join(word["word"] for word in old))
+            new_text = lexical_text("".join(word["word"] for word in local))
+            identity = lambda word: (word["word"], word["startTime"], word["endTime"])
+            old_ids, new_ids = [identity(word) for word in old], [identity(word) for word in local]
+            if len(local) < len(old) and old_ids[:len(local)] == new_ids:
+                continue
+            anchored = old_ids[0] == new_ids[0] and len(local) >= len(old) and (
+                start <= old[0]["startTime"] + 0.01 and end >= old[-1]["endTime"] - 0.01)
+            if not (old_text and new_text.startswith(old_text)) and not anchored and old_ids != new_ids:
+                raise ValueError("字幕部分重叠，无法可靠合并")
+            # 先替换整组再展开，避免最新快照修订字词或时间后遗留旧三元组。
+            groups = [group for group in groups if group not in overlapping]
+        groups.append({"text": event.get("text") or "".join(word["word"] for word in local), "words": local})
+    groups.sort(key=lambda group: group["words"][0]["startTime"])
+    words = normalize_words([word for group in groups for word in group["words"]], duration)
+    cues = [cue for group in groups for cue in sentence_cues(group["text"], group["words"])]
+    data = {"text": "".join(group["text"] for group in groups) or text, "words": words, "sentences": cues}
+    validate_cues(data, duration)
+    return data
+
+
+def clip_subtitles(clip, body, events, duration=None):
+    reason = ""
+    if clip.get("explicit_dialect"):
+        reason = "explicit_dialect"
+    elif clip.get("enable_latex_tn", False):
+        reason = "enable_latex_tn"
+    elif not body["req_params"]["audio_params"]["enable_subtitle"]:
+        reason = "disabled"
+    if not reason:
+        try:
+            data = subtitle_data(events, body["req_params"]["text"], duration)
+        except ValueError:
+            reason = "invalid_subtitles"
+        else:
+            if data["words"]:
+                return data, ""
+            reason = "not_returned"
+    return {"text": body["req_params"]["text"], "words": [], "sentences": []}, reason
+
+
+def build_timeline(segments):
+    frames, clips, words, sentences = 0, [], [], []
+    for segment in segments:
+        clip, data = segment["clip"], segment["subtitles"]
+        offset = frames / 24000
+        duration = segment["frames"] / 24000
+        pause = clip.get("pause_after_ms", 0)
+        clips.append({"id": clip["id"], "text": clip["text"], "subtitle_text": data["text"],
+                      "offset": offset, "duration": duration, "pause_after_ms": pause,
+                      "audio": segment["audio"], "words_file": segment["words_file"],
+                      "timestamps": bool(data["words"]), "timestamps_reason": segment["timestamps_reason"]})
+        for name, target in (("words", words), ("sentences", sentences)):
+            for item in data[name]:
+                target.append({**item, "clip": clip["id"],
+                               "startTime": round(offset + item["startTime"], 9),
+                               "endTime": round(offset + item["endTime"], 9)})
+        frames += segment["frames"] + 24 * pause
+    return {"sample_rate": 24000, "duration": frames / 24000,
+            "timestamps": all(clip["timestamps"] for clip in clips),
+            "clips": clips, "words": words, "sentences": sentences}
+
+
+def srt_text(timeline):
+    def stamp(seconds):
+        milliseconds = round(seconds * 1000)
+        seconds, ms = divmod(milliseconds, 1000)
+        minutes, sec = divmod(seconds, 60)
+        hours, minute = divmod(minutes, 60)
+        return f"{hours:02}:{minute:02}:{sec:02},{ms:03}"
+    return "".join(f"{i}\n{stamp(cue['startTime'])} --> {stamp(cue['endTime'])}\n"
+                   + " ".join(cue["text"].split()) + "\n\n"
+                   for i, cue in enumerate(timeline["sentences"], 1))
 
 
 def wav_bytes(pcm):
@@ -395,9 +713,99 @@ def wav_bytes(pcm):
     return buffer.getvalue()
 
 
-def render(plan, out, dry_run=False, retry_uncertain=False):
+def wav_frames(wav):
+    if (wav.getnchannels(), wav.getsampwidth(), wav.getframerate()) != (1, 2, 24000):
+        raise ValueError("缓存音频格式错误")
+    frames = wav.getnframes()
+    if frames <= 0:
+        raise ValueError("缓存音频为空")
+    return frames
+
+
+def pcm_chunks(wav, frames):
+    remaining = frames
+    while remaining:
+        count = min(remaining, PCM_CHUNK_FRAMES)
+        chunk = wav.readframes(count)
+        if len(chunk) != count * 2:
+            raise ValueError("缓存音频不完整")
+        yield chunk
+        remaining -= count
+
+
+def inspect_cached_wav(path):
+    with wave.open(str(path), "rb") as wav:
+        frames = wav_frames(wav)
+        for _ in pcm_chunks(wav, frames):
+            pass
+    return frames
+
+
+def write_pcm_wav(path, pcm):
+    temp = path.with_suffix(".tmp")
+    with wave.open(str(temp), "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(24000)
+        view = memoryview(pcm)
+        for start in range(0, len(pcm), PCM_CHUNK_FRAMES * 2):
+            wav.writeframesraw(view[start:start + PCM_CHUNK_FRAMES * 2])
+    temp.replace(path)
+
+
+def concatenate_wavs(segments, final_path):
+    temp = final_path.with_suffix(".tmp")
+    silence = b"\0\0" * PCM_CHUNK_FRAMES
+    try:
+        with wave.open(str(temp), "wb") as final:
+            final.setnchannels(1)
+            final.setsampwidth(2)
+            final.setframerate(24000)
+            for segment in segments:
+                with wave.open(str(final_path.parent / segment["audio"]), "rb") as wav:
+                    if wav_frames(wav) != segment["frames"]:
+                        raise ValueError("拼接时缓存音频帧数发生变化")
+                    for chunk in pcm_chunks(wav, segment["frames"]):
+                        final.writeframesraw(chunk)
+                remaining = 24 * segment["clip"].get("pause_after_ms", 0)
+                while remaining:
+                    count = min(remaining, PCM_CHUNK_FRAMES)
+                    final.writeframesraw(silence[:count * 2])
+                    remaining -= count
+        temp.replace(final_path)
+    except Exception:
+        if temp.exists():
+            temp.unlink()
+        raise
+
+
+def read_cached_clip(clip, body, out, fingerprint, entry, sidecar_updates=None):
+    try:
+        frames = inspect_cached_wav(out / (fingerprint + ".wav"))
+        words_path = out / (fingerprint + ".words.json")
+        cached = json.loads(words_path.read_text(encoding="utf-8")) if words_path.exists() else None
+        if body["req_params"]["audio_params"]["enable_subtitle"]:
+            data = normalize_cached_subtitles(cached, frames / 24000)
+            reason = "" if data["words"] else entry.get("timestamps_reason") or "not_returned"
+        else:
+            data, reason = clip_subtitles(clip, body, [])
+        if "timestamps" in entry and (type(entry["timestamps"]) is not bool or entry["timestamps"] != bool(data["words"])):
+            raise ValueError("字幕缓存与已记录的 timestamps 状态不一致")
+        if sidecar_updates is not None and cached != data:
+            sidecar_updates[words_path] = data
+        return frames, data, reason
+    except (ValueError, KeyError, TypeError, OSError, wave.Error, EOFError):
+        raise RuntimeError(f"片段 {clip['id']} 的音频或字幕缓存无效；需要重新渲染。"
+                           "请核对费用与授权后使用新的输出目录；未自动重发") from None
+
+
+def render(plan, out, dry_run=False, retry_uncertain=False, timestamps=None, debug_stream=False):
     validate(plan, complete=True)
-    jobs = [(clip, request_body(clip), resolve_resource(clip)) for clip in plan["clips"]]
+    if timestamps is not None and type(timestamps) is not bool:
+        raise ValueError("timestamps 必须为布尔值")
+    jobs = [(clip, request_body(clip, timestamps if timestamps is not None else
+             clip.get("enable_subtitle", plan.get("enable_subtitle", True))), resolve_resource(clip))
+            for clip in plan["clips"]]
     routes = [{"clip": clip["id"], "speaker": clip["voice"], "resource_id": resource,
                "endpoint": ENDPOINT} for clip, _, resource in jobs]
     out.mkdir(parents=True, exist_ok=True)
@@ -412,28 +820,48 @@ def render(plan, out, dry_run=False, retry_uncertain=False):
     manifest_path = out / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
     fingerprints = [request_fingerprint(body, resource) for _, body, resource in jobs]
-    for _, body, resource in jobs:
-        if resource != "seed-tts-2.0" and request_fingerprint(body, "seed-tts-2.0") in manifest:
+    cached_clips, sidecar_updates, manifest_dirty = {}, {}, False
+    for (clip, body, resource), fingerprint in zip(jobs, fingerprints):
+        legacy_body = json.loads(json.dumps(body))
+        del legacy_body["req_params"]["audio_params"]["enable_subtitle"]
+        legacy = request_fingerprint(legacy_body, resource)
+        if resource != "seed-tts-2.0" and any(request_fingerprint(b, "seed-tts-2.0") in manifest
+                                            for b in (body, legacy_body)):
             raise RuntimeError("已有未绑定资源的旧克隆请求记录；请先核对服务记录，不自动复用或重发")
-    if not retry_uncertain and any(manifest.get(f, {}).get("status") == "uncertain" for f in fingerprints):
-        raise RuntimeError("已有结果不确定的请求；核对服务记录与授权后才能 --retry-uncertain")
-    pcm_all = bytearray()
+        entry = manifest.get(fingerprint, {})
+        old = manifest.get(legacy, {}) if entry.get("status") != "complete" else {}
+        if not retry_uncertain and any(e.get("status") == "uncertain" for e in (entry, old)):
+            raise RuntimeError("已有结果不确定的请求；核对服务记录与授权后才能 --retry-uncertain")
+        if body["req_params"]["audio_params"]["enable_subtitle"]:
+            for cached, record in ((fingerprint, entry), (legacy, old)):
+                if record.get("status") == "complete" and not (out / (cached + ".words.json")).is_file():
+                    raise RuntimeError(f"片段 {clip['id']} 已有音频缓存但缺少 words.json；需要重新渲染以获取时间戳。"
+                                       "请核对费用与授权后使用新的输出目录；未自动重发")
+        if entry.get("status") == "complete" and fingerprint not in cached_clips:
+            # 在任何新调用前校验全部完成缓存，不能先收费再发现后段缓存损坏。
+            cached_clips[fingerprint] = read_cached_clip(clip, body, out, fingerprint, entry, sidecar_updates)
+            frames, data, reason = cached_clips[fingerprint]
+            metadata = {"words_file": fingerprint + ".words.json", "timestamps": bool(data["words"]),
+                        "timestamps_reason": reason}
+            if any(entry.get(name) != value for name, value in metadata.items()):
+                entry.update(metadata)
+                manifest_dirty = True
+    for path, data in sidecar_updates.items():
+        save(path, data)
+    segments = []
     for (clip, body, resource), fingerprint in zip(jobs, fingerprints):
         audio_path = out / (fingerprint + ".wav")
+        words_path = out / (fingerprint + ".words.json")
         entry = manifest.get(fingerprint, {})
         if entry.get("status") == "complete":
-            with wave.open(str(audio_path), "rb") as wav:
-                if (wav.getnchannels(), wav.getsampwidth(), wav.getframerate()) != (1, 2, 24000):
-                    raise ValueError("缓存音频格式错误")
-                pcm = wav.readframes(wav.getnframes())
-                if not pcm:
-                    raise ValueError("缓存音频为空")
+            frames, data, reason = cached_clips[fingerprint]
         else:
             request_id = str(uuid.uuid4())
             entry = {"status": "uncertain", "request_id": request_id, "clip": clip["id"],
                      "resource_id": resource, "endpoint": ENDPOINT}
             manifest[fingerprint] = entry
             save(manifest_path, manifest)
+            manifest_dirty = False
             request = urllib.request.Request(ENDPOINT, data=json.dumps(body, ensure_ascii=False).encode(),
                 headers={"Content-Type": "application/json", "X-Api-Key": key,
                          "X-Api-Resource-Id": resource, "X-Api-Request-Id": request_id}, method="POST")
@@ -443,23 +871,34 @@ def render(plan, out, dry_run=False, retry_uncertain=False):
                 opener = urllib.request.build_opener(NoRedirect)
                 with opener.open(request, timeout=90) as response:
                     entry["logid"] = response.headers.get("X-Tt-Logid")
-                    pcm, usage = decode_stream(response)
-                temp = audio_path.with_suffix(".tmp")
-                temp.write_bytes(wav_bytes(pcm))
-                temp.replace(audio_path)
-                entry.update(status="complete", usage=usage, seconds=round(time.monotonic() - started, 3))
+                    pcm, usage, events = decode_stream(response, (lambda frame: debug_frame(frame, key)) if debug_stream else None)
+                frames = len(pcm) // 2
+                data, reason = clip_subtitles(clip, body, events, frames / 24000)
+                write_pcm_wav(audio_path, pcm)
+                del pcm
+                save(words_path, data)
+                entry.update(status="complete", usage=usage, seconds=round(time.monotonic() - started, 3),
+                             words_file=words_path.name, timestamps=bool(data["words"]), timestamps_reason=reason)
                 save(manifest_path, manifest)
             except Exception as exc:
-                entry.update(error_type=type(exc).__name__, seconds=round(time.monotonic() - started, 3))
+                entry.update(status="uncertain", error_type=type(exc).__name__, seconds=round(time.monotonic() - started, 3))
                 save(manifest_path, manifest)
                 raise RuntimeError(f"片段 {clip['id']} 结果不确定（{type(exc).__name__}）；未自动重试") from None
-        pcm_all.extend(pcm)
-        pcm_all.extend(b"\0\0" * (24 * clip.get("pause_after_ms", 0)))
+        cached_clips[fingerprint] = (frames, data, reason)
+        segments.append({"clip": clip, "frames": frames, "audio": audio_path.name,
+                         "words_file": words_path.name, "subtitles": data, "timestamps_reason": reason})
+    if manifest_dirty:
+        save(manifest_path, manifest)
     final = out / "final.wav"
-    temp = final.with_suffix(".tmp")
-    temp.write_bytes(wav_bytes(pcm_all))
-    temp.replace(final)
-    return {"audio": str(final.resolve()), "clips": len(jobs)}
+    concatenate_wavs(segments, final)
+    timeline = build_timeline(segments)
+    save(out / "timeline.json", timeline)
+    srt = out / "final.srt"
+    temp = srt.with_suffix(".tmp")
+    temp.write_text(srt_text(timeline), encoding="utf-8")
+    temp.replace(srt)
+    return {"audio": str(final.resolve()), "clips": len(jobs), "timestamps": timeline["timestamps"],
+            "timeline": str((out / "timeline.json").resolve()), "srt": str(srt.resolve())}
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -482,6 +921,9 @@ def main():
         if command == "render":
             cmd.add_argument("--dry-run", action="store_true")
             cmd.add_argument("--retry-uncertain", action="store_true")
+            cmd.add_argument("--timestamps", action=argparse.BooleanOptionalAction, default=None,
+                             help="启用逐字字幕（默认开启）；--no-timestamps 关闭，覆盖计划设置")
+            cmd.add_argument("--debug-stream", action="store_true", help="向 stderr 输出脱敏响应帧，不输出凭据或音频数据")
     args = parser.parse_args()
     try:
         if args.command == "prepare":
@@ -495,7 +937,7 @@ def main():
                 preview(plan, args.out)
                 result = {"preview": str((args.out / "director.html").resolve())}
             else:
-                result = render(plan, args.out, args.dry_run, args.retry_uncertain)
+                result = render(plan, args.out, args.dry_run, args.retry_uncertain, args.timestamps, args.debug_stream)
         print(json.dumps(result, ensure_ascii=False))
     except (ValueError, RuntimeError, OSError, KeyError, TypeError) as exc:
         print(f"错误：{exc}", file=sys.stderr)

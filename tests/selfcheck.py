@@ -9,6 +9,7 @@ import os
 import tempfile
 import uuid
 import wave
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -86,8 +87,9 @@ def clone_checks(plan, frames, pcm):
         legacy_out = out / "legacy"
         tts.save(legacy_out / "manifest.json", {legacy: {"status": "complete"}})
         (legacy_out / (legacy + ".wav")).write_bytes(tts.wav_bytes(pcm))
+        tts.save(legacy_out / (legacy + ".words.json"), {"text": mixed["clips"][0]["text"], "words": []})
         preset = {"clips": [copy.deepcopy(mixed["clips"][0])]}
-        with patch.dict(os.environ, {"VOLC_TTS_API_KEY": "offline-fake-key"}), patch.object(
+        with patch.dict(os.environ, {"VOLC_TTS_API_KEY": "offline-fake-key"}, clear=True), patch.object(
                 tts.urllib.request, "build_opener", return_value=Opener()) as network:
             tts.render(preset, legacy_out)
             preset["clips"][0]["resource_id"] = "seed-tts-2.0"
@@ -124,6 +126,679 @@ def clone_checks(plan, frames, pcm):
             assert all(e["status"] == "uncertain" and e["resource_id"] == "seed-icl-2.0" for e in entries.values())
         assert all("offline-fake-key" not in f.read_text() for f in out.rglob("*.json"))
         assert tts.NoRedirect().redirect_request(None, None, 302, "", {}, "https://example.com") is None
+
+
+def timestamp_checks():
+    plan = tts.prepare("你好。再见！")
+    clip = plan["clips"][0]
+    for row in clip["readings"]:
+        assert row["text"] in ("好", "见")
+        row.update(status="reviewed", pinyin=[{"好": "hao3", "见": "jian4"}[row["text"]]])
+    clip["pause_after_ms"] = 375
+    second = copy.deepcopy(clip)
+    second.update(id="second", pause_after_ms=125)
+    plan["clips"].append(second)
+    pcm = b"\x01\x00" * 48000
+    first_sentence = {"text": "你好。", "phonemes": [], "words": [
+        {"word": "你", "startTime": 0.1, "endTime": 0.4, "confidence": 0.95},
+        {"word": "好。", "startTime": 0.4, "endTime": 0.8, "confidence": 0.96}]}
+    last_sentence = {"text": "再见！", "words": [
+        {"word": "再", "startTime": 1.1, "endTime": 1.4, "confidence": 0.95},
+        {"word": "见！", "startTime": 1.4, "endTime": 1.8, "confidence": 0.96}]}
+    events = [first_sentence, last_sentence]
+    def line(frame):
+        return json.dumps(frame, ensure_ascii=False).encode()
+    frames = [line({"code": 0, "data": base64.b64encode(pcm[:48000]).decode(), "sentence": first_sentence}),
+              line({"code": 0, "data": base64.b64encode(pcm[48000:]).decode()}),
+              b"\n", line({"code": 0, "data": None, "sentence": last_sentence}),
+              line({"code": 20000000, "message": "OK", "usage": {"text_words": 4}})]
+    debug = []
+    assert tts.decode_stream(frames, debug.append) == (pcm, {"text_words": 4}, events)
+    assert len(debug) == 4 and debug[-2]["sentence"] == last_sentence, "收集最后音频之后的字幕"
+    terminal = frames[:-2] + [line({"code": 20000000, "sentence": last_sentence})]
+    assert tts.decode_stream(terminal)[2] == events, "完成帧携带的字幕也不能丢"
+    # 防御性测试：不把完成码后的额外字幕当作官方正常帧序，但也不静默截断。
+    after_terminal = frames[:2] + [line({"code": 20000000}), frames[-2]]
+    assert tts.decode_stream(after_terminal)[2] == events
+    fails(lambda: tts.decode_stream(frames[:-1]), "有完整字幕但无完成码仍失败")
+    data = tts.subtitle_data(events + [last_sentence], clip["text"])
+    assert data["text"] == clip["text"] and len(data["words"]) == 4
+    assert data["sentences"] == [
+        {"text": "你好。", "startTime": 0.1, "endTime": 0.8},
+        {"text": "再见！", "startTime": 1.1, "endTime": 1.8}]
+    cumulative = copy.deepcopy(first_sentence)
+    cumulative["words"] = cumulative["words"][:1]
+    assert tts.subtitle_data([cumulative, first_sentence], "你好。")["text"] == "你好。"
+    assert len(tts.subtitle_data([first_sentence, first_sentence], "你好。")["words"]) == 2
+    paragraph = {"text": clip["text"], "words": data["words"]}
+    assert tts.subtitle_data([paragraph], clip["text"])["sentences"] == data["sentences"], "一个字幕帧按句分 SRT"
+    quoted = {"text": "“你好。”\n再见！", "words": data["words"]}
+    assert [cue["text"] for cue in tts.subtitle_data([quoted], quoted["text"])["sentences"]] == ["“你好。”", "再见！"]
+    assert tts.subtitle_data([{"text": clip["text"], "words": [], "phonemes": []}] + events,
+                             clip["text"])["text"] == clip["text"], "空字幕预告帧不能重复正文"
+    whole = {"text": "你好。再见！大家好。", "words": data["words"] + [
+        {"word": "大", "startTime": 2.2, "endTime": 2.4},
+        {"word": "家", "startTime": 2.4, "endTime": 2.6},
+        {"word": "好。", "startTime": 2.6, "endTime": 2.9}]}
+    merged = tts.subtitle_data(events + [whole], whole["text"])
+    assert merged["text"] == whole["text"] and len(merged["sentences"]) == 3
+    revised = {**first_sentence, "text": "你好！"}
+    assert tts.subtitle_data([first_sentence, revised], "你好。")["text"] == "你好！", "同时间字词的标点修订要保留"
+    assert tts.clip_subtitles(clip, tts.request_body(clip), events, 0.1)[1] == "invalid_subtitles"
+    assert tts.sentence_cues("编号123。", [{"word": "一百二十三", "startTime": 0.2, "endTime": 1.2}]) == [
+        {"text": "编号123。", "startTime": 0.2, "endTime": 1.2}], "文本规范化不能猜逐字时间"
+    enabled = tts.request_body(clip)
+    disabled = tts.request_body(clip, False)
+    assert enabled["req_params"]["audio_params"]["enable_subtitle"] is True
+    assert "enable_timestamp" not in json.dumps(enabled)
+    legacy = copy.deepcopy(enabled)
+    del legacy["req_params"]["audio_params"]["enable_subtitle"]
+    for resource in ("seed-tts-2.0", "seed-icl-2.0"):
+        assert len({tts.request_fingerprint(body, resource) for body in (enabled, disabled, legacy)}) == 3
+    for value in ("true", 1, None):
+        bad = copy.deepcopy(plan)
+        bad["enable_subtitle"] = value
+        fails(lambda: tts.validate(bad), "计划字幕开关必须为布尔值")
+        for name in ("enable_subtitle", "enable_latex_tn"):
+            bad = copy.deepcopy(plan)
+            bad["clips"][0][name] = value
+            fails(lambda: tts.validate(bad), "片段字幕/LaTeX 开关必须为布尔值")
+    for name, value, reason in (("explicit_dialect", "beijing", "explicit_dialect"),
+                               ("enable_latex_tn", True, "enable_latex_tn"),
+                               ("enable_subtitle", False, "disabled")):
+        downgraded = copy.deepcopy(clip)
+        downgraded[name] = value
+        body = tts.request_body(downgraded)
+        assert body["req_params"]["audio_params"]["enable_subtitle"] is False
+        if name == "enable_latex_tn":
+            assert json.loads(body["req_params"]["additions"])[name] is True
+        result, cause = tts.clip_subtitles(downgraded, body, events)
+        assert not result["words"] and cause == reason
+    assert tts.clip_subtitles(clip, enabled, [])[1] == "not_returned"
+    assert tts.clip_subtitles(clip, enabled, [{"text": clip["text"], "words": [], "phonemes": []}])[1] == "not_returned"
+    for start, end in ((-1, 0), (1, 0), (float("nan"), 1), (0, float("inf")), ("0", 1)):
+        bad_event = copy.deepcopy(first_sentence)
+        bad_event["words"][0].update(startTime=start, endTime=end)
+        assert tts.clip_subtitles(clip, enabled, [bad_event])[1] == "invalid_subtitles"
+    secret = "offline-subtitle-secret"
+    logs = io.StringIO()
+    with redirect_stderr(logs):
+        tts.debug_frame({"code": 0, "data": "AAAA", "sentence": first_sentence,
+                         "X-Api-Key": secret, "message": "echo " + secret,
+                         "nested": {secret: [secret], "token": "another-secret"}}, secret)
+    assert secret not in logs.getvalue() and "another-secret" not in logs.getvalue()
+    assert "sentence" in logs.getvalue() and "AAAA" not in logs.getvalue()
+    class Response(io.BytesIO):
+        headers = {"X-Tt-Logid": "offline-subtitles"}
+    class Opener:
+        def open(self, request, timeout):
+            assert json.loads(request.data)["req_params"]["audio_params"]["enable_subtitle"] is True
+            return Response(b"\n".join(frames))
+    with tempfile.TemporaryDirectory(prefix="volce-timestamps-check-") as directory:
+        out = Path(directory)
+        switched = copy.deepcopy(plan)
+        switched["enable_subtitle"] = False
+        switched["clips"][0]["enable_subtitle"] = True
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+                tts.urllib.request, "build_opener", side_effect=AssertionError("dry-run 不能联网")):
+            tts.render(switched, out / "dry", dry_run=True, debug_stream=True)
+            requests = json.loads((out / "dry/requests.json").read_text())
+            assert [r["req_params"]["audio_params"]["enable_subtitle"] for r in requests] == [True, False]
+            for flag in (True, False):
+                tts.render(switched, out / "dry", dry_run=True, timestamps=flag)
+                assert all(r["req_params"]["audio_params"]["enable_subtitle"] is flag
+                           for r in json.loads((out / "dry/requests.json").read_text()))
+            assert not list((out / "dry").glob("*.wav")) and not (out / "dry/timeline.json").exists()
+            for flag in ("--timestamps", "--no-timestamps"):
+                with patch("sys.argv", ["tts.py", "render", "--plan", str(out / "cli.json"),
+                                         "--out", str(out / "cli"), "--dry-run", flag]), redirect_stdout(io.StringIO()):
+                    tts.save(out / "cli.json", switched)
+                    assert tts.main() == 0
+                    assert all(r["req_params"]["audio_params"]["enable_subtitle"] is (flag == "--timestamps")
+                               for r in json.loads((out / "cli/requests.json").read_text()))
+        with patch.dict(os.environ, {"VOLC_TTS_API_KEY": secret}, clear=True), patch.object(
+                tts.urllib.request, "build_opener", return_value=Opener()) as network:
+            rendered = tts.render(plan, out / "audio")
+            assert network.call_count == 1, "同请求不同 clip ID 与停顿复用音频与字幕"
+            assert rendered["timestamps"] is True
+            timeline = json.loads((out / "audio/timeline.json").read_text())
+            assert timeline["duration"] == 4.5
+            assert [c["offset"] for c in timeline["clips"]] == [0, 2.375]
+            assert timeline["words"][4]["startTime"] == 2.475
+            assert timeline["words"][-1]["endTime"] == 4.175
+            assert timeline["sentences"][2]["text"] == "你好。"
+            assert "3\n00:00:02,475 --> 00:00:03,175\n你好。" in (out / "audio/final.srt").read_text()
+            with wave.open(str(out / "audio/final.wav")) as wav:
+                assert wav.getnframes() == 108000
+            fingerprint = tts.request_fingerprint(enabled, "seed-tts-2.0")
+            sidecar = out / "audio" / (fingerprint + ".words.json")
+            assert json.loads(sidecar.read_text()) == data
+            entry = json.loads((out / "audio/manifest.json").read_text())[fingerprint]
+            assert entry["timestamps"] is True and entry["words_file"] == sidecar.name
+            assert tts.render(plan, out / "audio") == rendered and network.call_count == 1
+            changed = copy.deepcopy(plan)
+            changed["clips"][0]["pause_after_ms"] = 1000
+            tts.render(changed, out / "audio")
+            updated = json.loads((out / "audio/timeline.json").read_text())
+            assert updated["clips"][1]["offset"] == 3 and updated["words"][4]["startTime"] == 3.1
+            assert network.call_count == 1
+            normalized = copy.deepcopy(data)
+            normalized["words"] = list(reversed(normalized["words"])) + [normalized["words"][0]]
+            tts.save(sidecar, normalized)
+            tts.render(plan, out / "audio")
+            assert json.loads((out / "audio/timeline.json").read_text())["words"][:4] == timeline["words"][:4]
+            new_first = copy.deepcopy(plan)
+            new_first["clips"][0]["direction"] = "低声叙述。"
+            invalid_cues = copy.deepcopy(data)
+            invalid_cues["sentences"][0].update(text="无关旧句子", startTime=-2, endTime=90)
+            invalid_words = copy.deepcopy(data)
+            invalid_words["words"][-1]["endTime"] = 90
+            stale_text = copy.deepcopy(data)
+            stale_text["sentences"][0]["text"] = "无关旧句子"
+            for content in ("{", "[]", json.dumps(invalid_cues), json.dumps(invalid_words),
+                            json.dumps(stale_text), '{"text":"你好。"}'):
+                sidecar.write_text(content)
+                fails(lambda: tts.render(new_first, out / "audio"), "损坏缓存必须在任何新调用前校验")
+                assert network.call_count == 1
+            tts.save(sidecar, data)
+            # 丢失新缓存 sidecar，或遇到未带字幕开关的旧缓存，均在任何调用之前阻断。
+            sidecar.unlink()
+            for cached in (fingerprint, tts.request_fingerprint(legacy, "seed-tts-2.0")):
+                tts.save(out / "missing/manifest.json", {cached: {"status": "complete"}})
+                try:
+                    tts.render(new_first, out / "missing")
+                except RuntimeError as exc:
+                    assert "需要重新渲染" in str(exc) and "未自动重发" in str(exc)
+                else:
+                    raise AssertionError("缺字幕缓存不能静默复用或重发")
+                assert network.call_count == 1
+            fails(lambda: tts.render(plan, out / "audio"), "缺失字幕 sidecar 应阻断缓存命中")
+            old_fingerprint = tts.request_fingerprint(legacy, "seed-tts-2.0")
+            tts.save(out / "uncertain/manifest.json", {old_fingerprint: {"status": "uncertain"}})
+            fails(lambda: tts.render(new_first, out / "uncertain"), "新增字幕字段不能绕过旧 uncertain")
+            assert network.call_count == 1
+            no_subtitles = [frames[1], frames[-1]]
+            with patch.object(tts.urllib.request, "build_opener") as fallback_network:
+                fallback_network.return_value.open.side_effect = lambda *args, **kwargs: Response(b"\n".join(no_subtitles))
+                tts.render(plan, out / "fallback")
+                tts.render(plan, out / "fallback")
+                assert fallback_network.return_value.open.call_count == 1, "无字幕也缓存，不反复计费"
+                entries = json.loads((out / "fallback/manifest.json").read_text())
+                assert all(e["timestamps"] is False and e["timestamps_reason"] == "not_returned" for e in entries.values())
+                assert (out / "fallback/final.srt").read_text() == ""
+                fallback = json.loads((out / "fallback/timeline.json").read_text())
+                assert fallback["timestamps"] is False and fallback["words"] == []
+                mixed = copy.deepcopy(plan)
+                mixed["clips"][1]["explicit_dialect"] = "beijing"
+                tts.render(mixed, out / "mixed")
+                statuses = list(json.loads((out / "mixed/manifest.json").read_text()).values())
+                assert any(e["timestamps_reason"] == "explicit_dialect" for e in statuses)
+                for controls, reason in (({}, "invalid_subtitles"), ({"enable_latex_tn": True}, "enable_latex_tn")):
+                    short_plan = copy.deepcopy(plan)
+                    short_plan["clips"][0].update(controls)
+                    short_plan["clips"] = short_plan["clips"][:1]
+                    short_stream = [line({"code": 0, "data": base64.b64encode(pcm[:4800]).decode(),
+                                          "sentence": first_sentence}), frames[-1]]
+                    fallback_network.return_value.open.side_effect = lambda *args, **kwargs: Response(b"\n".join(short_stream))
+                    tts.render(short_plan, out / reason)
+                    entry = next(iter(json.loads((out / reason / "manifest.json").read_text()).values()))
+                    assert entry["timestamps"] is False and entry["timestamps_reason"] == reason
+                    assert (out / reason / "final.srt").read_text() == ""
+        assert all(secret not in f.read_text() for f in out.rglob("*.json"))
+    empty = {"text": "你好。", "words": [], "sentences": []}
+    precise = tts.build_timeline([
+        {"clip": {"id": "tiny", "text": "你好。", "pause_after_ms": 1}, "frames": 24001,
+         "audio": "tiny.wav", "words_file": "tiny.words.json", "subtitles": empty, "timestamps_reason": "disabled"},
+        {"clip": {"id": "next", "text": "你好。"}, "frames": 7,
+         "audio": "next.wav", "words_file": "next.words.json", "subtitles": empty, "timestamps_reason": "disabled"}])
+    assert precise["clips"][1]["offset"] == 24025 / 24000
+    assert precise["duration"] == 24032 / 24000, "偏移不能将 PCM 时长提前舍入到毫秒"
+
+
+def timestamp_review_checks():
+    """十项评审回归；全部事件/WAV/缓存均为合成夹具，不是线上协议证据。"""
+    fake_key = "offline-timestamp-review-key"
+
+    def word(text, start, end):
+        return {"word": text, "startTime": start, "endTime": end}
+
+    def cue(text, start, end):
+        return {"text": text, "startTime": start, "endTime": end}
+
+    def reviewed_plan(text="你好。再见！"):
+        plan = tts.prepare(text)
+        for clip in plan["clips"]:
+            for row in clip["readings"]:
+                row["status"] = "reviewed"
+        tts.validate(plan, complete=True)
+        return plan
+
+    base_plan = reviewed_plan()
+    base_words = [word("你", .1, .4), word("好。", .4, .8),
+                  word("再", 1.1, 1.4), word("见！", 1.4, 1.8)]
+    base_data = {"text": "你好。再见！", "words": base_words,
+                 "sentences": [cue("你好。", .1, .8), cue("再见！", 1.1, 1.8)]}
+    pcm = b"\x01\x00" * 48000
+
+    class Response(io.BytesIO):
+        headers = {"X-Tt-Logid": "offline-timestamp-review"}
+
+    def stream(events, audio=pcm):
+        frames = [{"code": 0, "data": base64.b64encode(audio).decode()}]
+        frames.extend({"code": 0, "sentence": event} for event in events)
+        frames.append({"code": 20000000, "usage": {"text_words": 4}})
+        return b"\n".join(json.dumps(frame, ensure_ascii=False).encode() for frame in frames)
+
+    def fingerprint(clip):
+        return tts.request_fingerprint(tts.request_body(clip), tts.resolve_resource(clip))
+
+    def cached(directory, plan=base_plan, data=base_data, frames=48000, metadata=True):
+        directory.mkdir(parents=True, exist_ok=True)
+        manifest = {}
+        for index, clip in enumerate(plan["clips"]):
+            fp = fingerprint(clip)
+            # 不同缓存文件使用不同 PCM，避免拼接顺序错误被全静音夹具掩盖。
+            audio = bytes((index + 1, 0)) * frames
+            (directory / (fp + ".wav")).write_bytes(tts.wav_bytes(audio))
+            tts.save(directory / (fp + ".words.json"), data)
+            entry = {"status": "complete"}
+            if metadata:
+                entry.update(words_file=fp + ".words.json", timestamps=bool(data["words"]),
+                             timestamps_reason="" if data["words"] else "not_returned")
+            manifest[fp] = entry
+        tts.save(directory / "manifest.json", manifest)
+        return manifest
+
+    def new_before_cached(plan):
+        mixed = copy.deepcopy(plan)
+        new = copy.deepcopy(plan["clips"][0])
+        new.update(id="new-before-cache", direction="低声清楚地说。")
+        mixed["clips"].insert(0, new)
+        return mixed
+
+    def cache_rejected(plan, directory):
+        with patch.object(tts.urllib.request, "build_opener",
+                          side_effect=AssertionError("损坏后段缓存之前不得发出新请求")) as network:
+            try:
+                tts.render(new_before_cached(plan), directory)
+            except RuntimeError as exc:
+                assert "需要重新渲染" in str(exc) and "未自动重发" in str(exc), str(exc)
+            else:
+                raise AssertionError("无效缓存必须友好拒绝，不得复用")
+            assert network.call_count == 0, "缓存预检必须先于任何新请求"
+
+    def fresh_invalid(plan, events, directory):
+        with patch.object(tts.urllib.request, "build_opener") as network:
+            network.return_value.open.return_value = Response(stream(events))
+            result = tts.render(plan, directory)
+            assert network.call_count == 1
+        entry = json.loads((directory / "manifest.json").read_text())[fingerprint(plan["clips"][0])]
+        assert entry["status"] == "complete", "字幕错误不能令完整音频变 uncertain"
+        assert entry["timestamps"] is False and entry["timestamps_reason"] == "invalid_subtitles"
+        assert result["timestamps"] is False and (directory / "final.srt").read_text() == ""
+        data = json.loads((directory / entry["words_file"]).read_text())
+        assert data == {"text": tts.request_body(plan["clips"][0])["req_params"]["text"],
+                        "words": [], "sentences": []}
+        with wave.open(str(directory / "final.wav"), "rb") as wav:
+            assert wav.getnframes() == len(pcm) // 2 and wav.readframes(48000) == pcm
+
+    def public_data(data):
+        assert set(data) == {"text", "words", "sentences"}
+        assert all(set(item) == {"text", "startTime", "endTime"} for item in data["sentences"])
+        assert all(set(item) <= {"word", "startTime", "endTime", "confidence"} for item in data["words"])
+
+    def huge_json_numbers(directory):
+        huge = json.loads("1" + "0" * 399)
+        assert huge == 10 ** 399, "必须覆盖 JSON 可解析、但不能转换为 float 的整数"
+        for field in ("startTime", "endTime", "confidence"):
+            bad = copy.deepcopy(base_data)
+            bad["words"][0][field] = huge
+            fresh_invalid(base_plan, [bad], directory / ("fresh-" + field))
+            out = directory / ("cache-word-" + field)
+            cached(out, data=bad)
+            cache_rejected(base_plan, out)
+        for field in ("startTime", "endTime"):
+            bad = copy.deepcopy(base_data)
+            bad["sentences"][0][field] = huge
+            out = directory / ("cache-cue-" + field)
+            cached(out, data=bad)
+            cache_rejected(base_plan, out)
+
+    def cumulative_revisions(directory):
+        first = {"text": "你好", "words": [word("你", .1, .4), word("好", .4, .8)]}
+        variants = [
+            {"text": "你好。", "words": [word("你", .1, .4), word("好。", .4, .8)]},
+            {"text": "你好。", "words": [word("你", .1, .4), word("好。", .4, .85)]},
+            {"text": "你好。", "words": [word("你", .11, .41), word("好。", .41, .86)]}]
+        for revised in variants:
+            data = tts.subtitle_data([first, revised, revised], "你好。", 2)
+            assert data == {"text": revised["text"], "words": revised["words"],
+                            "sentences": [cue("你好。", revised["words"][0]["startTime"],
+                                              revised["words"][-1]["endTime"])]}, "只保留最新累计帧，不能残留旧三元组"
+            public_data(data)
+        old_punctuation = {"text": "你好！", "words": variants[0]["words"]}
+        assert tts.subtitle_data([variants[0], old_punctuation], "你好。") == {
+            "text": "你好！", "words": variants[0]["words"], "sentences": [cue("你好！", .1, .8)]}
+        whole = {"text": base_data["text"], "words": variants[-1]["words"] + base_words[2:]}
+        data = tts.subtitle_data([first, {"text": "再见！", "words": base_words[2:]}, whole, whole],
+                                 whole["text"], 2)
+        assert data == {"text": whole["text"], "words": whole["words"],
+                        "sentences": [cue("你好。", .11, .86), cue("再见！", 1.1, 1.8)]}
+        partial = {"text": "好。再", "words": [variants[0]["words"][1], base_words[2]]}
+        assert tts.clip_subtitles(base_plan["clips"][0], tts.request_body(base_plan["clips"][0]),
+                                  [variants[0], partial], 2)[1] == "invalid_subtitles", "真正的部分重叠不能猜合并"
+        fresh_invalid(base_plan, [variants[0], partial], directory / "ambiguous")
+
+    def punctuation_ownership(directory):
+        shared = [word("你", .1, .4), word("好", .4, .8), word("。", .8, .8),
+                  word("再", .8, 1.4), word("见！", 1.4, 1.8)]
+        expected = [cue("你好。", .1, .8), cue("再见！", .8, 1.8)]
+        data = tts.subtitle_data([{"text": base_data["text"], "words": shared}], base_data["text"], 2)
+        assert data == {"text": base_data["text"], "words": shared, "sentences": expected}
+        assert tts.sentence_cues(base_data["text"], shared) == expected
+        public_data(data)
+        repeated = [word("你", .1, .4), word("好", .4, .8), word("。", .8, .81),
+                    word("。", .81, .82), word("再", .82, 1.4), word("见", 1.4, 1.8),
+                    word("！", 1.8, 1.81), word("！", 1.81, 1.82)]
+        text = "你好。。再见！！"
+        data = tts.subtitle_data([{"text": text, "words": repeated}], text, 2)
+        assert data["words"] == repeated
+        assert data["sentences"] == [cue("你好。。", .1, .82), cue("再见！！", .82, 1.82)]
+        numeric_words = [word("编号", .1, .3), word("一百二十三", .3, 1),
+                         word("你", 1.2, 1.4), word("好。", 1.4, 1.6)]
+        assert tts.sentence_cues("编号123。你好。", numeric_words) == [
+            cue("编号123。", .1, 1), cue("你好。", 1.2, 1.6)], "后句的唯一词锚点应保留数字规范化句界"
+        out = directory / "shared-cache"
+        cached(out, data={"text": base_data["text"], "words": shared, "sentences": expected})
+        tts.render(base_plan, out)
+        assert json.loads((out / "timeline.json").read_text())["words"] == [
+            {**item, "clip": base_plan["clips"][0]["id"]} for item in shared]
+
+    def spanning_tokens(directory):
+        single = [word("甲。乙。", 0, 1)]
+        assert tts.sentence_cues("甲。乙。", single) == [cue("甲。乙。", 0, 1)]
+        plan = reviewed_plan("甲。乙。")
+        data, reason = tts.clip_subtitles(plan["clips"][0], tts.request_body(plan["clips"][0]),
+                                        [{"text": "甲。乙。", "words": single}], 2)
+        assert reason == "" and data["sentences"] == [cue("甲。乙。", 0, 1)]
+        words = [word("前。", 0, .2), word("甲。乙。", .3, 1), word("后。", 1.2, 1.5)]
+        text = "前。甲。乙。后。"
+        expected = [cue("前。", 0, .2), cue("甲。乙。", .3, 1), cue("后。", 1.2, 1.5)]
+        assert tts.sentence_cues(text, words) == expected, "跨句词只能拥有一个合并后的 cue"
+        data = tts.subtitle_data([{"text": text, "words": words}], text, 2)
+        assert data == {"text": text, "words": words, "sentences": expected}
+        public_data(data)
+
+    def empty_timestamp_metadata(directory):
+        empty = {"text": base_data["text"], "words": [], "sentences": []}
+        out = directory / "affirmative-empty"
+        manifest = cached(out, data=empty)
+        entry = manifest[fingerprint(base_plan["clips"][0])]
+        entry.update(timestamps=True, timestamps_reason="")
+        tts.save(out / "manifest.json", manifest)
+        cache_rejected(base_plan, out)
+        for name, metadata in (("explicit-not-returned", True), ("legacy-empty", False)):
+            out = directory / name
+            cached(out, data=empty, metadata=metadata)
+            for _ in range(2):
+                result = tts.render(base_plan, out)
+                assert result["timestamps"] is False
+            entry = json.loads((out / "manifest.json").read_text())[fingerprint(base_plan["clips"][0])]
+            assert entry["timestamps"] is False and entry["timestamps_reason"] == "not_returned"
+
+    def cache_cue_ownership(directory):
+        shifted_text = copy.deepcopy(base_data)
+        shifted_text["sentences"] = [cue("你好。再", .1, .8), cue("见！", 1.1, 1.8)]
+        assert "".join(item["text"] for item in shifted_text["sentences"]) == shifted_text["text"]
+        out = directory / "shifted-text-boundary"
+        cached(out, data=shifted_text)
+        cache_rejected(base_plan, out)
+        numeric_plan = reviewed_plan("编号123。你好。")
+        numeric = {"text": "编号123。你好。", "words": [word("编号", .1, .3), word("一百二十三", .3, 1),
+                   word("你", 1.2, 1.4), word("好。", 1.4, 1.6)],
+                   "sentences": [cue("编号123。", .1, 1), cue("你好。", 1.2, 1.6)]}
+        out = directory / "normalized-number"
+        cached(out, plan=numeric_plan, data=numeric)
+        assert tts.render(numeric_plan, out)["timestamps"] is True
+        timeline = json.loads((out / "timeline.json").read_text())
+        assert timeline["sentences"] == [{**item, "clip": numeric_plan["clips"][0]["id"]}
+                                         for item in numeric["sentences"]]
+        revised = copy.deepcopy(base_data)
+        revised.update(text="你好！\n再见。", sentences=[cue("你好！", .1, .8), cue("再见。", 1.1, 1.8)])
+        out = directory / "punctuation-whitespace-revision"
+        cached(out, data=revised)
+        assert tts.render(base_plan, out)["timestamps"] is True
+        timeline = json.loads((out / "timeline.json").read_text())
+        assert timeline["clips"][0]["subtitle_text"] == revised["text"]
+        assert [item["text"] for item in timeline["sentences"]] == ["你好！", "再见。"]
+
+    def zero_duration_speech(directory):
+        plan = reviewed_plan("你好。")
+        event = {"text": "你好。", "words": [word("你好。", .5, .5)]}
+        fresh_invalid(plan, [event], directory / "fresh-zero")
+        out = directory / "cached-zero"
+        cached(out, plan=plan, data={**event, "sentences": [cue("你好。", .5, .5)]})
+        cache_rejected(plan, out)
+        positive = [word("你好", .1, .5), word("。", .5, .5)]
+        assert tts.subtitle_data([{"text": "你好。", "words": positive}], "你好。", 2) == {
+            "text": "你好。", "words": positive, "sentences": [cue("你好。", .1, .5)]}
+
+    def bounded_wav_reads(directory):
+        assert tts.PCM_CHUNK_FRAMES == 24000
+        plan = copy.deepcopy(base_plan)
+        plan["clips"] = []
+        lengths = [24001, 72007, 96011]
+        empty = {"text": base_data["text"], "words": [], "sentences": []}
+        manifest, sources = {}, {}
+        for index, frames in enumerate(lengths):
+            clip = copy.deepcopy(base_plan["clips"][0])
+            clip.update(id="long-" + str(index), direction="自然清楚地说。" + "再" * index,
+                        pause_after_ms=30000 if index == 2 else index + 1)
+            plan["clips"].append(clip)
+            fp = fingerprint(clip)
+            audio = bytes((index + 1, 0)) * frames
+            sources[fp] = (frames, audio)
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / (fp + ".wav")).write_bytes(tts.wav_bytes(audio))
+            tts.save(directory / (fp + ".words.json"), empty)
+            manifest[fp] = {"status": "complete", "words_file": fp + ".words.json",
+                            "timestamps": False, "timestamps_reason": "not_returned"}
+        duplicate = copy.deepcopy(plan["clips"][0])
+        duplicate.update(id="long-duplicate", pause_after_ms=3)
+        plan["clips"].insert(1, duplicate)
+        tts.save(directory / "manifest.json", manifest)
+        sizes, writes, descriptors = [], [], []
+        original_read = wave.Wave_read.readframes
+        original_write = wave.Wave_write.writeframesraw
+        original_concatenate = tts.concatenate_wavs
+
+        def read(wav, frames):
+            sizes.append(frames)
+            assert 0 <= frames <= tts.PCM_CHUNK_FRAMES, "WAV 读取不能按整段/整文件请求"
+            return original_read(wav, frames)
+
+        def write(wav, data):
+            writes.append(len(data))
+            assert len(data) <= 2 * tts.PCM_CHUNK_FRAMES, "最终 PCM（包括长停顿）必须分块写入"
+            return original_write(wav, data)
+
+        def no_pcm(value):
+            assert not isinstance(value, (bytes, bytearray, memoryview)), "缓存/拼接描述符不能保留 PCM"
+            if isinstance(value, dict):
+                for item in value.values():
+                    no_pcm(item)
+            elif isinstance(value, (tuple, list)):
+                for item in value:
+                    no_pcm(item)
+
+        def concatenate(segments, final_path):
+            no_pcm(segments)
+            assert all(type(segment["frames"]) is int for segment in segments)
+            descriptors.extend(copy.deepcopy(segments))
+            return original_concatenate(segments, final_path)
+
+        with patch.object(wave.Wave_read, "readframes", read), patch.object(
+                wave.Wave_write, "writeframesraw", write), patch.object(
+                tts, "concatenate_wavs", side_effect=concatenate), patch.object(
+                tts, "read_cached_clip", wraps=tts.read_cached_clip) as inspections:
+            tts.render(plan, directory)
+            assert inspections.call_count == len(sources), "同 fingerprint 只预检一次，不重复读取"
+            clip = plan["clips"][0]
+            result = tts.read_cached_clip(clip, tts.request_body(clip), directory,
+                                          fingerprint(clip), manifest[fingerprint(clip)])
+            assert type(result[0]) is int and result[0] == lengths[0], "read_cached_clip 返回帧数，不是 PCM"
+            no_pcm(result)
+        assert sizes and writes and descriptors
+        total = sum(sources[fingerprint(clip)][0] + 24 * clip["pause_after_ms"] for clip in plan["clips"])
+        timeline = json.loads((directory / "timeline.json").read_text())
+        assert timeline["duration"] == total / 24000
+        assert timeline["clips"][1]["offset"] == (24001 + 24) / 24000
+        assert [segment["frames"] for segment in descriptors] == [24001, 24001, 72007, 96011]
+        expected = b"".join(sources[fingerprint(clip)][1] + b"\0\0" * (24 * clip["pause_after_ms"])
+                            for clip in plan["clips"])
+        with wave.open(str(directory / "final.wav"), "rb") as wav:
+            assert wav.getnframes() == total
+            actual = bytearray()
+            while part := wav.readframes(tts.PCM_CHUNK_FRAMES):
+                actual.extend(part)
+        assert actual == expected, "非整秒帧数、重复缓存、拼接顺序与末尾停顿必须逐样本正确"
+        later = directory / (fingerprint(plan["clips"][-1]) + ".wav")
+        later.write_bytes(later.read_bytes()[:-2])
+        cache_rejected(plan, directory)
+
+    def manifest_write_lifecycle(directory):
+        original_save = tts.save
+        writes = []
+
+        def save(path, data):
+            path = Path(path)
+            if path.name == "manifest.json":
+                snapshot = copy.deepcopy(data)
+                for fp, entry in snapshot.items():
+                    if entry["status"] == "complete":
+                        assert (path.parent / (fp + ".wav")).is_file()
+                        assert isinstance(json.loads((path.parent / (fp + ".words.json")).read_text()), dict)
+                writes.append(snapshot)
+            original_save(path, data)
+            if path.name == "manifest.json":
+                assert json.loads(path.read_text()) == data, "状态写入必须在调用继续前落盘"
+
+        out = directory / "warm"
+        cached(out)
+        with patch.object(tts, "save", side_effect=save):
+            tts.render(base_plan, out)
+            assert writes == [], "正常 warm hit 不得重写 manifest"
+            paused = copy.deepcopy(base_plan)
+            paused["clips"][0]["pause_after_ms"] = 30000
+            tts.render(paused, out)
+            assert writes == [], "只改停顿不能重写请求状态"
+        legacy_plan = copy.deepcopy(base_plan)
+        second = copy.deepcopy(base_plan["clips"][0])
+        second.update(id="second-legacy", direction="轻声清楚地说。")
+        legacy_plan["clips"].append(second)
+        empty = {"text": base_data["text"], "words": [], "sentences": []}
+        out = directory / "legacy-batch"
+        cached(out, plan=legacy_plan, data=empty, metadata=False)
+        with patch.object(tts, "save", side_effect=save):
+            tts.render(legacy_plan, out)
+            assert len(writes) == 1 and len(writes[0]) == 2, "多个旧元数据迁移必须批量一次保存"
+            assert all(entry["timestamps_reason"] == "not_returned" and entry["timestamps"] is False
+                       for entry in writes[0].values())
+            writes.clear()
+            tts.render(legacy_plan, out)
+            assert writes == [], "已迁移旧缓存的 warm hit 不再写 manifest"
+        duplicate_plan = copy.deepcopy(base_plan)
+        for index in range(2):
+            duplicate = copy.deepcopy(base_plan["clips"][0])
+            duplicate.update(id="new-duplicate-" + str(index), pause_after_ms=index + 1)
+            duplicate_plan["clips"].append(duplicate)
+        out = directory / "new-request"
+        fp = fingerprint(base_plan["clips"][0])
+
+        def opener():
+            entry = json.loads((out / "manifest.json").read_text())[fp]
+            assert entry["status"] == "uncertain", "打开网络连接前必须已有持久 uncertain 记录"
+            assert not (out / (fp + ".wav")).exists() and not (out / (fp + ".words.json")).exists()
+            class Opener:
+                def open(self, request, timeout):
+                    assert request.get_header("X-api-key") == fake_key
+                    assert json.loads(request.data) == tts.request_body(base_plan["clips"][0])
+                    return Response(stream([base_data]))
+            return Opener()
+
+        with patch.object(tts, "save", side_effect=save), patch.object(
+                tts.urllib.request, "build_opener", side_effect=lambda *args: opener()) as network:
+            tts.render(duplicate_plan, out)
+            assert network.call_count == 1, "新请求的重复 fingerprint 不能再次合成"
+            assert len(writes) == 2, "重复片段不能在 uncertain/complete 两次持久写之外重写 manifest"
+            assert [snapshot[fp]["status"] for snapshot in writes] == ["uncertain", "complete"]
+            writes.clear()
+            tts.render(duplicate_plan, out)
+            assert not writes and network.call_count == 1
+        out = directory / "failed-request"
+
+        def broken_opener(*args):
+            assert json.loads((out / "manifest.json").read_text())[fp]["status"] == "uncertain"
+            raise OSError("offline synthetic connection failure")
+
+        with patch.object(tts, "save", side_effect=save), patch.object(
+                tts.urllib.request, "build_opener", side_effect=broken_opener) as network:
+            fails(lambda: tts.render(base_plan, out), "失败请求必须停止")
+            assert len(writes) == 2 and all(snapshot[fp]["status"] == "uncertain" for snapshot in writes)
+            entry = json.loads((out / "manifest.json").read_text())[fp]
+            assert entry["status"] == "uncertain" and entry["error_type"] == "OSError"
+            assert not (out / (fp + ".wav")).exists() and not (out / (fp + ".words.json")).exists()
+            writes.clear()
+            fails(lambda: tts.render(base_plan, out), "uncertain 请求不能自动重发")
+            assert not writes and network.call_count == 1
+
+    def cache_without_regeneration(directory):
+        out = directory / "normal"
+        cached(out)
+        with patch.object(tts, "subtitle_data", side_effect=AssertionError("缓存命中不得重建字幕事件")), patch.object(
+                tts, "sentence_cues", side_effect=AssertionError("已有保存 cues 不得废弃后重建")):
+            tts.render(base_plan, out)
+            normalized = copy.deepcopy(base_data)
+            normalized["words"] = list(reversed(base_words)) + [base_words[0]]
+            tts.save(out / (fingerprint(base_plan["clips"][0]) + ".words.json"), normalized)
+            tts.render(base_plan, out)
+            timeline = json.loads((out / "timeline.json").read_text())
+            assert timeline["words"] == [{**item, "clip": base_plan["clips"][0]["id"]} for item in base_words]
+        old = copy.deepcopy(base_data)
+        del old["sentences"]
+        out = directory / "old-no-sentences"
+        cached(out, data=old)
+        with patch.object(tts, "subtitle_data", side_effect=AssertionError("旧缓存也只做直接规范化")), patch.object(
+                tts, "sentence_cues", wraps=tts.sentence_cues) as reconstruction:
+            tts.render(base_plan, out)
+            assert reconstruction.call_count == 1, "缺 sentences 的旧 sidecar 只重建一次"
+            tts.render(base_plan, out)
+            assert reconstruction.call_count == 1, "重建结果须保存，随后 warm hit 不再重建"
+        saved = json.loads((out / (fingerprint(base_plan["clips"][0]) + ".words.json")).read_text())
+        assert saved == base_data
+
+    checks = [("1 huge JSON numbers", huge_json_numbers),
+              ("2 cumulative revisions", cumulative_revisions),
+              ("3 punctuation ownership", punctuation_ownership),
+              ("4 spanning tokens", spanning_tokens),
+              ("5 empty timestamp metadata", empty_timestamp_metadata),
+              ("6 cache cue ownership", cache_cue_ownership),
+              ("7 zero duration speech", zero_duration_speech),
+              ("8 bounded WAV reads", bounded_wav_reads),
+              ("9 manifest lifecycle", manifest_write_lifecycle),
+              ("10 cache without regeneration", cache_without_regeneration)]
+    failures = []
+    with tempfile.TemporaryDirectory(prefix="volce-timestamp-review-") as directory, patch.dict(
+            os.environ, {"VOLC_TTS_API_KEY": fake_key}, clear=True), patch.object(
+            tts.urllib.request, "build_opener", side_effect=AssertionError("离线回归不得发出真实请求")):
+        for index, (name, check) in enumerate(checks):
+            try:
+                check(Path(directory) / str(index + 1))
+            except Exception as exc:
+                failures.append(f"{name}: {type(exc).__name__}: {exc}")
+        assert all(fake_key not in path.read_text() for path in Path(directory).rglob("*.json"))
+    if failures:
+        raise AssertionError("timestamp_review_checks 回归失败：\n" + "\n".join(failures))
 
 
 def demo():
@@ -238,7 +913,7 @@ def demo():
     pcm = b"\x01\x00" * 240
     frames = [json.dumps({"code": 0, "data": base64.b64encode(pcm).decode()}).encode(),
               b'{"code":20000000,"usage":{"text_words":9}}']
-    assert tts.decode_stream(frames) == (pcm, {"text_words": 9})
+    assert tts.decode_stream(frames) == (pcm, {"text_words": 9}, [])
     fails(lambda: tts.decode_stream(frames[:1]), "断流不能当成功")
     fails(lambda: tts.decode_stream([b'{"code":55000000}']), "错误码不能忽略")
     class Response(io.BytesIO):
@@ -265,7 +940,7 @@ def demo():
             assert all(value in displayed for value in (clip["direction"], clip["reference_text"], "北京话", "-10"))
         with patch.dict(os.environ, {}, clear=True), patch.object(tts.urllib.request, "build_opener", side_effect=AssertionError("dry-run 不能联网")):
             assert tts.render(plan, out / "audio", dry_run=True)["clips"] == 3
-        with patch.dict(os.environ, {"VOLC_TTS_API_KEY": "offline-fake-key"}), patch.object(
+        with patch.dict(os.environ, {"VOLC_TTS_API_KEY": "offline-fake-key"}, clear=True), patch.object(
                 tts.urllib.request, "build_opener", return_value=Opener()) as network:
             tts.render(plan, out / "audio")
             assert network.call_count == 3
@@ -292,7 +967,9 @@ def demo():
         assert "offline-fake-key" not in (out / "audio/manifest.json").read_text()
         assert "offline-fake-key" not in (out / "audio/requests.json").read_text()
     clone_checks(plan, frames, pcm)
-    print("PASS：中文校对、原文保留、纠音冲突、语音指令与引用上文、方言、断流、预览、预置/克隆资源接线、WAV与新旧缓存")
+    timestamp_checks()
+    timestamp_review_checks()
+    print("PASS：中文校对、原文保留、纠音冲突、语音指令与引用上文、方言、断流、预览、预置/克隆资源接线、WAV与新旧缓存、字幕晚到与脱敏、逐字时间线、句级 SRT、字幕开关与降级、十项时间戳评审回归")
 
 
 if __name__ == "__main__":

@@ -109,10 +109,38 @@ uv run skills/volce-tts-director/scripts/tts.py prepare --text-file 原稿.txt -
 | 语速与停顿 | 设置语速和片段后的停顿，停顿由本地拼接处理 |
 | 分角色对白 | 各角色片段分别合成，按顺序拼接 |
 | 音频导出 | 输出 24 kHz、单声道、16-bit WAV，同时保存无凭据的请求与调用状态 |
+| 逐字时间戳与字幕 | 每段输出 `*.words.json`，合并为含停顿偏移的 `timeline.json` 和句级 `final.srt`，用于对口型、字幕 |
 
 引用上文是本工具的计划字段 `reference_text`，当前通过自然语言说明接入 `context_texts`。不同音色对指令、上文和纠音的遵循程度需要试听验证。
 
 当前只做中文，接入豆包 TTS 2.0 预置音色、已有的声音复刻 2.0 音色和 v3 单向 HTTP 接口。不支持录音上传/音色训练、旧代际复刻接口、SSML、英文配音、原生多人联合合成或实时播放。
+
+## 逐字时间戳与字幕
+
+默认请求 `req_params.audio_params.enable_subtitle: true`，适用于 TTS 2.0 / ICL 2.0（`seed-tts-2.0` / `seed-icl-2.0`）。**不使用 TTS 1.0 的 `enable_timestamp`。** 可在计划顶层或单个 clip 设置 `"enable_subtitle": false`；片段覆盖顶层，CLI `--timestamps / --no-timestamps` 覆盖两者。切换开关属于不同请求，可能需要新的收费合成。
+
+```sh
+# 只检查开启字幕的请求，不读取密钥、不联网
+uv run skills/volce-tts-director/scripts/tts.py render --plan plan.json --out outputs/音频 --timestamps --dry-run
+
+# 已授权的合成；省略 --timestamps 也默认开启
+uv run skills/volce-tts-director/scripts/tts.py render --plan plan.json --out outputs/音频 --timestamps
+```
+
+生成目录包含：
+
+- `<hash>.wav` 和同名 `<hash>.words.json`：`text`、`words` 列表及句级 `sentences`。每个词条保留服务端的 `word / startTime / endTime / confidence`（若返回）；时间是**秒，相对本次片段请求开始**。中文通常按字，标点可能附在字上，不人为拆分或估算时间。服务端字幕可能体现可听别名或数字转写，不保证与原稿逐字相同。
+- `timeline.json`：`clips[].offset` 为片段在 `final.wav` 中的秒偏移，另含音频时长、`pause_after_ms`、文件路径与字幕状态；顶层 `words / sentences` 已换算到**全片秒时间**并附 `clip` ID。偏移按真实 PCM 采样数累计，包含本地停顿；延续原有行为，最后片段的段后停顿也计入最终时长。
+- `final.srt`：根据返回字幕文字按中文句末标点分句，以所属字词的真实首尾时间生成字幕，不覆盖段间停顿。一个 timed token 跨句时合并字幕，不拆分其时间；零时长标点只归属一个正时长句子。数字规范化等无法逐字匹配时，仅在文字锚点可唯一确定句界时保留分句，否则保留该字幕帧的整句与首尾时间，不猜测内部时间。
+- `manifest.json`：每个请求记录 `words_file`、`timestamps` 和 `timestamps_reason`。`timeline.timestamps` 只有全部片段有字幕才为 `true`；部分片段缺字幕时仍保留其他片段的有效字词与偏移。
+
+**时间戳精度由火山接口负责。** 本工具保留返回字词的原始时间和置信度；只在拼接时间线中加上片段偏移、导出 SRT 时转换为毫秒格式，不校正服务端对齐、不裁剪音频，也不引入强制对齐模型。`timestamps: true` 表示字幕可解析和导出，不保证精确口型。末字与音频末尾的差距或低置信度属于服务端质量观察，不应单独判定本工具的请求、保存或导出失败。
+
+使用 `explicit_dialect`、片段 `enable_latex_tn: true`、关闭字幕、未返回或返回无效字幕时，保留正常音频输出，记录 `timestamps: false` 与具体原因，字幕文件为显式空列表。时间戳必须可表示为有限数值、非负、有序且不超过片段音频时长（仅容许 10ms 量化误差），句级时长必须大于零；不裁剪或猜测无效时间。累计字幕中能可靠识别的字词、标点或时间修订保留最新快照，含糊的部分重叠明确降级。不要把空字幕称为对口型验收通过。
+
+缓存指纹包含字幕开关。旧音频缺少 `words.json`，或已完成的新缓存丢失此文件时，开启字幕会**在调用前停止并明确提示需要重新渲染**；不会静默跳过、估算字幕或自动重发。核对费用与授权后使用新的输出目录重渲染。接口成功但未返回字幕的空结果也缓存，不自动反复收费尝试。manifest 标记 `timestamps: true` 却出现空 sidecar 时，视为缓存损坏并拒绝；旧记录缺少字幕状态时兼容迁移，不自动重请求。全部 WAV 以固定块读取预检完整性，最终音频流式拼接，不保留全片 PCM；未变化或仅调整停顿的缓存渲染不重写 manifest，元数据迁移批量保存，真实请求仍即时记录 uncertain/complete。
+
+HTTP JSON 行的实际字幕字段是顶层 `sentence`，不是 WebSocket 事件封装；字幕可能晚于音频。解析必须有完成码 `20000000`，并读到响应 EOF，避免截掉晚到字幕。可用 `--debug-stream` 向 stderr 输出脱敏响应帧（音频仅显示长度，不输出密钥或请求头），用于核对协议；不触发额外请求。依据：[官方 HTTP 字幕参数与响应格式](https://docs.volcengine.com/docs/DoubaoVoice/unidirectional-streaming-text-to-speech-http?lang=zh)。
 
 ## 从命令行运行
 
@@ -159,4 +187,4 @@ uv run skills/volce-tts-director/scripts/tts.py render --plan plan.json --out ou
 uv run --with pypinyin==0.55.0 python tests/selfcheck.py
 ```
 
-检查覆盖中文校对、原文保留、纠音冲突、语音指令与引用上文接线、断流处理、WAV 拼接与缓存。接口依据：[火山官方 HTTP 文档](https://docs.volcengine.com/docs/DoubaoVoice/unidirectional-streaming-text-to-speech-http?lang=zh)、[语音指令与能力说明](https://docs.volcengine.com/docs/DoubaoVoice/DoubaoTextToSpeech20CapabilityIntroduction?lang=zh)。
+检查覆盖中文校对、原文保留、纠音冲突、语音指令与引用上文接线、断流处理、WAV 拼接与缓存，以及字幕同帧/晚到、停顿偏移合并、句级 SRT、字幕缓存指纹、缺文件阻断、降级与调试脱敏。真实接口测试须按授权执行，核对响应完整、返回字词与落盘原始值一致，以及时间线和 SRT 导出正确；离线测试不替代真实接口证据。末字结束与 WAV 时长差（例如 0.3 秒参考值）只作为供应商对齐质量观察，记录后不自动校正或重试，不作为本工具导出成功与否的判据。接口依据：[火山官方 HTTP 文档](https://docs.volcengine.com/docs/DoubaoVoice/unidirectional-streaming-text-to-speech-http?lang=zh)、[语音指令与能力说明](https://docs.volcengine.com/docs/DoubaoVoice/DoubaoTextToSpeech20CapabilityIntroduction?lang=zh)。

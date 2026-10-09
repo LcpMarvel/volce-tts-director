@@ -42,7 +42,7 @@ uv run scripts/tts.py render --plan plan.json --out 音频
 
 只允许官方固定端点 `https://openspeech.bytedance.com/api/v3/tts/unidirectional`，资源限定 `seed-tts-2.0`（`zh_` 预置音色）和 `seed-icl-2.0`（`S_` 已有克隆音色），不隐式代理到其他供应商。可用音色以用户控制台权限为准；离线检查只验证 ID 格式和本工具的资源组合，不能证明账号权限、训练状态或中文发音效果。
 
-`speech_rate` 为整数 -50～100（0 为正常）；`pause_after_ms` 为本地拼接停顿，0～30000 毫秒；`direction` 写中文导演说明。请求输出 24kHz 单声道 PCM，使用 Python 标准库包装成 WAV、顺序拼接，无需 ffmpeg。正式调用保存无凭据的请求、请求 ID、服务端 logid、用量与耗时。字幕未实现，不虚构时间戳。
+`speech_rate` 为整数 -50～100（0 为正常）；`pause_after_ms` 为本地拼接停顿，0～30000 毫秒；`direction` 写中文导演说明。请求输出 24kHz 单声道 PCM，使用 Python 标准库包装成 WAV、顺序拼接，无需 ffmpeg。正式调用保存无凭据的请求、请求 ID、服务端 logid、用量与耗时。默认启用逐字字幕，输出片段 `*.words.json`、全片 `timeline.json` 和句级 `final.srt`；未返回字幕时明确标记，不虚构时间戳，详见 [逐字时间戳与字幕](#逐字时间戳与字幕)。
 
 输出目录必须由当前任务独占。`render` 顺序调用，先验证全部段，再调用 API；完成段按实际请求内容复用。`manifest.json` 的 `uncertain` 表示调用结果不确定，默认不再次发送。先核对服务记录、预算与用户授权，只有允许再调用时加 `--retry-uncertain`。不要在同一输出目录同时启动两个 render。
 
@@ -55,6 +55,49 @@ uv run --with pypinyin==0.55.0 python tests/selfcheck.py
 ```
 
 协议依据（2026-09-30 核对）：[火山官方 HTTP 接口](https://docs.volcengine.com/docs/DoubaoVoice/unidirectional-streaming-text-to-speech-http?lang=zh)；候选词典行为：[pypinyin 官方文档](https://github.com/mozillazg/python-pinyin/blob/master/docs/usage.rst)。本工具不保证词典完整或模型遵循指令，正式生成后仍需试听多音字所在句。
+
+## 逐字时间戳与字幕
+
+TTS 2.0 / ICL 2.0 使用 `audio_params.enable_subtitle`，不是 1.0 的 `enable_timestamp`。默认开启；优先级是 CLI `--timestamps / --no-timestamps` > clip `enable_subtitle` > 顶层 `enable_subtitle` > true。字段只接受 JSON 布尔值，不接受 `"true"` 或数字。
+
+```json
+{
+  "enable_subtitle": true,
+  "clips": [
+    {"id": "001", "text": "你好。", "voice": "zh_female_vv_uranus_bigtts",
+     "readings": [{"start": 1, "text": "好", "pinyin": ["hao3"], "status": "reviewed", "delivery": "native"}]}
+  ]
+}
+```
+
+```sh
+uv run scripts/tts.py render --plan plan.json --out 音频 --timestamps --dry-run
+# 已授权后，只发送计划内请求，不自动重试
+uv run scripts/tts.py render --plan plan.json --out 音频 --timestamps
+# 可选：核对响应 JSON 行，不打印密钥、请求头或 base64 音频
+uv run scripts/tts.py render --plan plan.json --out 调试音频 --timestamps --debug-stream
+```
+
+HTTP 使用顶层 `sentence: {text, words, phonemes}`，`words` 词条为 `{word, startTime, endTime, confidence}`；时间单位秒，相对本次请求起点。`phonemes` 不用于推断未返回的字词时间。音频与字幕可在同帧，字幕也可能在最后音频之后；脚本要求完成码 `20000000` 并读取到响应 EOF。实际末帧与字幕顺序应通过真实响应核对，不把 WebSocket 格式或一次请求的顺序当作所有响应的保证。
+
+输出结构：
+
+- `<hash>.words.json`：`text` 为服务端字幕文字（无字幕时为实际提交文字），`words` 保留原始片段秒时间，`sentences` 保存句级文字与所属字词的真实首尾时间。累计帧的字词/标点/时间修订只有在词汇与时间覆盖关系可可靠识别时替换旧组，含糊的部分重叠降级；不虚构服务端句子 ID。字幕中文字可能附标点、体现数字转写或可听别名，不强制拆成单一字符，也不将原稿强行映射到服务端字词。
+- `manifest.json` 请求条目：`words_file` 为相对输出目录的文件名，`timestamps` 为可用字词时间状态，`timestamps_reason` 为空或 `disabled / explicit_dialect / enable_latex_tn / not_returned / invalid_subtitles`。
+- `timeline.json`：`sample_rate: 24000`、`duration` 为最终 WAV 秒长度；`clips` 中含 `id / text / subtitle_text / offset / duration / pause_after_ms / audio / words_file / timestamps / timestamps_reason`。顶层 `words / sentences` 的 `startTime / endTime` 已加上该段 `offset`，并增加 `clip` ID。偏移严格按 PCM 采样数累计，包含全部本地段后停顿（包括最后片段），修改停顿不改变每段 words 文件。
+- `final.srt`：用返回文字的中文句末标点分句，按唯一连续字词归属取真实首尾时间，无假字幕填补停顿。跨句 token 合并字幕，不拆其时间；零时长标点允许附属于一个正时长句子，整句零时长无效。数字规范化等不能逐字对应时，只有真实文字锚点能唯一确定句界才保留分句，否则保留服务端整句时间。全无字幕时生成空文件，不捏造字幕。字词归属仅为本地内部索引，公开 JSON 格式不增加必需字段；旧 sidecar 仍可读取。
+
+`timeline.timestamps` 只有全部片段都有字幕才为 true；混合片段仍保留可用字词，不把没有字幕的音频时长省略出偏移计算。方言 `explicit_dialect`、片段 `enable_latex_tn: true` 与字幕不兼容，自动将该请求的字幕开关设为 false（LaTeX 开关本身传入 additions）；无字幕/无效字幕正常输出 WAV 和空字词文件，并在 manifest 标记原因。不为补齐字幕自动重试或换资源。
+
+缓存指纹包含有效字幕开关，旧无开关指纹不会直接命中。开启字幕遇到旧完成缓存缺 words 文件，或当前完成缓存丢失 words 文件时，在整个计划联网前停止，明确提示需要重新渲染。核对费用和授权后用新的输出目录；不删除旧缓存，不自动重发。旧无开关 `uncertain` 也不能被新指纹静默绕过。正常无字幕的空 words 文件可复用，避免重复收费；manifest 标记 `timestamps: true` 却变成空 sidecar 时须拒绝，不能静默改为 false。历史记录缺少字幕状态时兼容迁移为实际可用状态，不自动请求补齐。全部已完成 WAV 和字幕缓存会在任何新调用前预检；损坏 JSON、截断/无效音频、句级文字错配字词时间等都会明确拒绝，不先调用前段再发现后段损坏。已有句子直接校验，不重新构造后丢弃；缺 sentences 的旧 sidecar 只兼容生成并保存一次。字词与句子时间须能表示为有限数值、非负、有序，并在实际片段 PCM 时长内（容许 10ms 时间量化误差，不裁剪）；句级时长须为正。新响应的无效字幕降级为 `invalid_subtitles`，无效缓存则提示需要重新渲染；两者都不自动请求补齐。
+
+WAV 预检按固定块读取全部声明 PCM 验证完整性，缓存只保留文件路径、帧数和字幕，不保留音频字节；最终 WAV 与长停顿也分块写入临时文件，完成后原子替换。未变化或仅修改停顿的缓存渲染不重写 manifest/相同字幕文件；旧元数据迁移批量保存。真实 API 调用仍在请求前即时保存 uncertain、音频和字幕文件写完后保存 complete，异常即时记录，不能为了减少写入而省略这些持久化检查点。
+
+时间戳的对齐精度由火山接口负责。本工具保留返回字词的原始 `startTime / endTime / confidence`，只做协议/结构校验、缓存保存、本地拼接偏移与 SRT 毫秒格式转换；不修改服务端字词时间、不裁剪音频、不引入强制对齐或其他精度补偿。`timestamps: true` 只表示字幕可解析和导出，不是精确口型保证。
+
+短句真实接口测试检查响应完整、接口字词与落盘原始值一致、时间线偏移和 SRT 导出正确；`words` 非空、时间有限且单调用于确认结构可用。最后 `endTime` 与 WAV 时长差（例如 0.3 秒参考值）、低 confidence 等另行记录为供应商对齐质量观察，不作为本工具请求/导出成功的必达条件。无字幕、服务质量观察或请求失败都应如实报告，不自动重试、修正或把观察项冒充实现错误。旧验收报告保留当时的检查结果，不改写历史以宣称通过；结构检查也不证明已试听或口型精度。
+
+协议依据：[官方 HTTP 字幕参数与 sentence 响应](https://docs.volcengine.com/docs/DoubaoVoice/unidirectional-streaming-text-to-speech-http?lang=zh)、[完成码与流式响应示例](https://www.volcengine.com/docs/6561/1598757)。
 
 ## 已有克隆音色
 
@@ -69,7 +112,7 @@ uv run scripts/tts.py prepare --text-file 原稿.txt --voice S_xWSg2NNT1 --resou
 
 阅读稿展示资源；dry-run 的 JSON 结果和 `routes.json` 包含逐片段 `clip`、`speaker`、`resource_id` 与固定 `endpoint`，不包含密钥；`requests.json` 保持请求体数组格式。dry-run 不联网、不读取密钥，但会写本地检查文件，不能证明音色已训练或账号有权限。正式请求使用 `X-Api-Resource-Id` 选择资源，不使用旧版 `cluster`。
 
-克隆缓存绑定端点、资源及请求体。预置资源保持原有请求体指纹，旧完成缓存继续复用，旧 `uncertain` 仍阻止重发；显式填写相同默认资源不会触发重复合成。若发现来源不明、未绑定资源的旧克隆记录，停止并要求核对，不错误复用或重新扣费。
+克隆缓存绑定端点、资源及请求体；预置资源按请求体生成指纹。请求体现在显式包含字幕开关，不能命中缺少该字段的旧音频缓存；开启字幕遇到缺 words 文件的旧完成缓存时先停止并提示重渲染，旧 `uncertain` 仍阻止静默重发。显式填写相同默认资源不会触发重复合成。若发现来源不明、未绑定资源的旧克隆记录，停止并要求核对，不错误复用或重新扣费。
 
 首次用新克隆音色时先试听一段短中文。权限、训练代际或网络出错时保留实际状态，不自动重试、切换资源或训练。成功与否以服务返回和 manifest 为准，实际演绎和相似度须试听，不能用结构检查代替。
 
