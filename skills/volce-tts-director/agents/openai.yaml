@@ -1,4 +1,4 @@
 interface:
-  display_name: "火山中文配音导演"
-  short_description: "中文稿件导演、多音字校对与读音展示，使用火山引擎生成配音"
-  default_prompt: "使用 $volce-tts-director 校对这份中文稿件，在阅读稿里标出多音字和读音，再按我的要求制作配音。"
+  display_name: "火山中英配音导演"
+  short_description: "中英混读、英文发音表与中文多音字校对，导出火山配音和字词时间戳"
+  default_prompt: "使用 $volce-tts-director 保留这份稿件里的中英文原文，配置品牌、缩写与型号读法，在阅读稿里标出中文多音字和读音，再按我的要求制作配音和字幕。"

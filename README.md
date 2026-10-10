@@ -1,6 +1,8 @@
-# volce-tts-director · 火山中文配音导演
+# volce-tts-director · 火山中英配音导演
 
-让你的 AI Agent 为中文稿件校对读音、安排演绎，再通过火山引擎豆包 TTS 2.0 生成配音。适用于中文旁白、故事朗读、有声内容和分角色对白。
+当前版本：[v0.3.0](https://github.com/LcpMarvel/volce-tts-director/releases/tag/v0.3.0) · 中英混读与可配置发音表。
+
+让你的 AI Agent 为中文及中英混读稿件校对读音、安排演绎，再通过火山引擎豆包 TTS 2.0 生成配音。适用于中文旁白、夹英文品牌/技术词/型号的讲解、故事朗读和分角色对白。英文保留原文，不自动转成中文音译。
 
 先看带注音的阅读稿，再听实际音频。原文、多音字读音、纠音方式和导演说明都可以查看与修改。
 
@@ -72,6 +74,30 @@ uv run skills/volce-tts-director/scripts/tts.py prepare --text-file 原稿.txt -
 
 仍需完成中文校对，再 preview、dry-run 和 render。阅读稿及 dry-run 会展示合成资源，音频目录的 `routes.json` 保存无凭据的片段路由；`requests.json` 仍只保存请求体。首次试听建议只用一个短句；调用失败不自动换资源或重试。
 
+## 中英混读与发音表
+
+英文品牌、技术词、缩写和数字可直接留在原稿，如 Anthropic、Claude、DeepSeek、Haiku 5.5、V4.1-Flash、OpenRouter、token、KV cache。汉字多音字仍按原文字符位置校对，不给英文逐字标普通话拼音。
+
+[默认发音表](skills/volce-tts-director/references/pronunciations.json)随 skill 安装，可复制修改后传入 `prepare --pronunciation-table`：
+
+```sh
+uv run skills/volce-tts-director/scripts/tts.py prepare \
+  --text-file examples/mixed/source.txt \
+  --voice zh_male_youyoujunzi_uranus_bigtts \
+  --pronunciation-table skills/volce-tts-director/references/pronunciations.json \
+  --out plan.json
+# 完成中文 readings 语境校对后，preview → render --dry-run → 已授权 render
+```
+
+- `words`：Anthropic → `an-THROP-ik`、Claude → `klawd`、Haiku → `HIGH-koo`，作为英语读音提示合入 `context_texts`。DeepSeek、OpenAI 等为 `null`，保留原生英语读法。**提示不是 IPA/CMU 音素控制，必须试听确认。**
+- `acronyms`：KV、API、MLA、GPU、IPO 逐字母读，S-1 读 `S one`；使用官方服务端文本转写字典，例如 `API/A P I`，不改 `req_params.text`。
+- `models`：显式列出要控制的型号，默认 `5.5` 和 `V4.1`；`decimal_point` 默认 `点`（Haiku 5.5 读“五点五”），也可改为英文 `point`。只编译出现的型号，不把所有日期/金额/IP 自动改读法。
+- 表内容快照写入计划顶层 `pronunciation_table`；预览/合成读取同一快照。编辑外部表不会悄悄改变旧计划，修改现有作品时直接编辑计划中的表。旧计划没有该字段时不自动套用默认表。
+
+官方音色表将 `zh_male_youyoujunzi_uranus_bigtts` 列为**悠悠君子 2.0**，中文音色也具备英语能力；继续使用 `seed-tts-2.0`。新混读计划使用官方 `explicit_language: "zh-cn"`（中文为主、支持中英混读）；纯英语片段可用 `en`，不要把中英混合段强制成 `en`。省略语言参数也有官方默认中英混读行为。无需 SSML 或额外语言检测。
+
+发音字典是请求内全局贪心最长匹配，源词最多 9 字符且不能有空格；OpenRouter 的原生读法/英语提示不受字典源词限制。同一缩写/型号还出现在别的词内部（如 `API` 与 `OpenAPI`）时，脚本检查实际最长匹配并拒绝误改，必要时明确完整词组或自然拆段。同一个 `5.5` 既作型号又作金额时，无法用全局字典分位置处理，须移除该规则或拆段。详见[中英混读参数与表格式](skills/volce-tts-director/references/mixed-language.md)。
+
 ## 中文纠音怎么做
 
 同一个字在同一段里可以有不同读音。上面的例子中：
@@ -113,7 +139,7 @@ uv run skills/volce-tts-director/scripts/tts.py prepare --text-file 原稿.txt -
 
 引用上文是本工具的计划字段 `reference_text`，当前通过自然语言说明接入 `context_texts`。不同音色对指令、上文和纠音的遵循程度需要试听验证。
 
-当前只做中文，接入豆包 TTS 2.0 预置音色、已有的声音复刻 2.0 音色和 v3 单向 HTTP 接口。不支持录音上传/音色训练、旧代际复刻接口、SSML、英文配音、原生多人联合合成或实时播放。
+当前支持中文与英文（含中英混读），接入豆包 TTS 2.0 预置音色、已有的声音复刻 2.0 音色和 v3 单向 HTTP 接口。具体音色的英语、指令和纠音能力以官方能力表及试听为准，不仅凭 `zh_` / `S_` 前缀推断。不支持其他字母体系、录音上传/音色训练、旧代际复刻接口、SSML、原生多人联合合成或实时播放。
 
 ## 逐字时间戳与字幕
 
@@ -129,9 +155,9 @@ uv run skills/volce-tts-director/scripts/tts.py render --plan plan.json --out ou
 
 生成目录包含：
 
-- `<hash>.wav` 和同名 `<hash>.words.json`：`text`、`words` 列表及句级 `sentences`。每个词条保留服务端的 `word / startTime / endTime / confidence`（若返回）；时间是**秒，相对本次片段请求开始**。中文通常按字，标点可能附在字上，不人为拆分或估算时间。服务端字幕可能体现可听别名或数字转写，不保证与原稿逐字相同。
+- `<hash>.wav` 和同名 `<hash>.words.json`：`text`、`words` 列表及句级 `sentences`。每个词条保留服务端的 `word / startTime / endTime / confidence`（若返回）；时间是**秒，相对本次片段请求开始**。中文通常按字、英文通常按词，标点可能附在词上，不人为拆分英文词或估算时间。服务端字幕可能体现字典转写、可听别名或数字规范化（如 `5.5` 返回 `five / point / five`），不保证与原稿逐字相同；原稿仍保留在 `timeline.clips[].text`。
 - `timeline.json`：`clips[].offset` 为片段在 `final.wav` 中的秒偏移，另含音频时长、`pause_after_ms`、文件路径与字幕状态；顶层 `words / sentences` 已换算到**全片秒时间**并附 `clip` ID。偏移按真实 PCM 采样数累计，包含本地停顿；延续原有行为，最后片段的段后停顿也计入最终时长。
-- `final.srt`：根据返回字幕文字按中文句末标点分句，以所属字词的真实首尾时间生成字幕，不覆盖段间停顿。一个 timed token 跨句时合并字幕，不拆分其时间；零时长标点只归属一个正时长句子。数字规范化等无法逐字匹配时，仅在文字锚点可唯一确定句界时保留分句，否则保留该字幕帧的整句与首尾时间，不猜测内部时间。
+- `final.srt`：根据返回字幕文字按中文句末标点及保守英文句界分句（不拆型号/小数点和常见缩写），以所属字词的真实首尾时间生成字幕，不覆盖段间停顿。一个 timed token 跨句时合并字幕，不拆分其时间；零时长标点只归属一个正时长句子。数字规范化等无法逐字匹配时，仅在文字锚点可唯一确定句界时保留分句，否则保留该字幕帧的整句与首尾时间，不猜测内部时间。
 - `manifest.json`：每个请求记录 `words_file`、`timestamps` 和 `timestamps_reason`。`timeline.timestamps` 只有全部片段有字幕才为 `true`；部分片段缺字幕时仍保留其他片段的有效字词与偏移。
 
 **时间戳精度由火山接口负责。** 本工具保留返回字词的原始时间和置信度；只在拼接时间线中加上片段偏移、导出 SRT 时转换为毫秒格式，不校正服务端对齐、不裁剪音频，也不引入强制对齐模型。`timestamps: true` 表示字幕可解析和导出，不保证精确口型。末字与音频末尾的差距或低置信度属于服务端质量观察，不应单独判定本工具的请求、保存或导出失败。
@@ -176,6 +202,7 @@ uv run skills/volce-tts-director/scripts/tts.py render --plan plan.json --out ou
 - [中文多音字示例](examples/chinese/director.md)：银行、行长、重庆、音乐与还款。
 - [华老栓示例](examples/hua-laoshuan/director.md)：保留原稿并展示按位置的可听替换。
 - [语音指令与引用上文示例](examples/context/director.md)：展示正文、演绎要求和前文。
+- [中英混读计划](examples/mixed/plan.json)与[原稿](examples/mixed/source.txt)：悠悠君子 2.0、英语品牌提示、型号中文“点”转写及字幕。
 - [SKILL.md](skills/volce-tts-director/SKILL.md)：Agent 的完整工作流程。
 - [运行与计划格式](skills/volce-tts-director/references/usage.md)：字段、纠音投递方式、方言和请求细节。
 

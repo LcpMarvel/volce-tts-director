@@ -10,7 +10,7 @@ uv run scripts/tts.py render --plan plan.json --out 音频 --dry-run
 uv run scripts/tts.py render --plan plan.json --out 音频
 ```
 
-`prepare` 不改动原文，尽量按句末分段；生成的多音字全部为 `pending`。`preview` 允许待校对项；`render`（包括 dry-run）要求扫描候选全部有已校对标注。不要简单批量把 pending 改为 reviewed：先校对实际语境。数字拼音用于请求，阅读稿自动转成声调符号；轻声的校对记号用 `5`，ü 用 `v`，如 `lv4`；普通轻声优先 `delivery: native`，详见 [轻声与自然语流](#轻声与自然语流)。
+`prepare` 不改动原文，尽量按句末分段；支持英文词、型号和数字（包括独立英文/数字片段），英文句界保守识别，不拆小数/型号内部点号和常见缩写。含英文时默认发音表快照写入计划，纯中文/数字稿不自动改变读法；可用 `--pronunciation-table 文件.json` 指定自定义表，格式见 [中英混读](mixed-language.md)。生成的汉字多音字全部为 `pending`。`preview` 允许待校对项；`render`（包括 dry-run）要求扫描候选全部有已校对标注。不要简单批量把 pending 改为 reviewed：先校对实际语境。数字拼音用于请求，阅读稿自动转成声调符号；轻声的校对记号用 `5`，ü 用 `v`，如 `lv4`；普通轻声优先 `delivery: native`，详见 [轻声与自然语流](#轻声与自然语流)。
 
 计划唯一来源为 JSON：
 
@@ -85,7 +85,7 @@ HTTP 使用顶层 `sentence: {text, words, phonemes}`，`words` 词条为 `{word
 - `<hash>.words.json`：`text` 为服务端字幕文字（无字幕时为实际提交文字），`words` 保留原始片段秒时间，`sentences` 保存句级文字与所属字词的真实首尾时间。累计帧的字词/标点/时间修订只有在词汇与时间覆盖关系可可靠识别时替换旧组，含糊的部分重叠降级；不虚构服务端句子 ID。字幕中文字可能附标点、体现数字转写或可听别名，不强制拆成单一字符，也不将原稿强行映射到服务端字词。
 - `manifest.json` 请求条目：`words_file` 为相对输出目录的文件名，`timestamps` 为可用字词时间状态，`timestamps_reason` 为空或 `disabled / explicit_dialect / enable_latex_tn / not_returned / invalid_subtitles`。
 - `timeline.json`：`sample_rate: 24000`、`duration` 为最终 WAV 秒长度；`clips` 中含 `id / text / subtitle_text / offset / duration / pause_after_ms / audio / words_file / timestamps / timestamps_reason`。顶层 `words / sentences` 的 `startTime / endTime` 已加上该段 `offset`，并增加 `clip` ID。偏移严格按 PCM 采样数累计，包含全部本地段后停顿（包括最后片段），修改停顿不改变每段 words 文件。
-- `final.srt`：用返回文字的中文句末标点分句，按唯一连续字词归属取真实首尾时间，无假字幕填补停顿。跨句 token 合并字幕，不拆其时间；零时长标点允许附属于一个正时长句子，整句零时长无效。数字规范化等不能逐字对应时，只有真实文字锚点能唯一确定句界才保留分句，否则保留服务端整句时间。全无字幕时生成空文件，不捏造字幕。字词归属仅为本地内部索引，公开 JSON 格式不增加必需字段；旧 sidecar 仍可读取。
+- `final.srt`：用返回文字的中文句末标点及保守英文句界分句，按唯一连续字词归属取真实首尾时间，无假字幕填补停顿。跨句 token 合并字幕，不拆其时间；零时长标点允许附属于一个正时长句子，整句零时长无效。数字规范化等不能逐字对应时，只有真实文字锚点能唯一确定句界才保留分句，否则保留服务端整句时间。全无字幕时生成空文件，不捏造字幕。字词归属仅为本地内部索引，公开 JSON 格式不增加必需字段；旧 sidecar 仍可读取。
 
 `timeline.timestamps` 只有全部片段都有字幕才为 true；混合片段仍保留可用字词，不把没有字幕的音频时长省略出偏移计算。方言 `explicit_dialect`、片段 `enable_latex_tn: true` 与字幕不兼容，自动将该请求的字幕开关设为 false（LaTeX 开关本身传入 additions）；无字幕/无效字幕正常输出 WAV 和空字词文件，并在 manifest 标记原因。不为补齐字幕自动重试或换资源。
 
@@ -123,7 +123,7 @@ uv run scripts/tts.py prepare --text-file 原稿.txt --voice S_xWSg2NNT1 --resou
 | 计划字段 | 用法 | 实际请求 |
 | --- | --- | --- |
 | direction | 中文语音指令，如“用兴奋但克制的语气，稍慢地说” | 合入 context_texts 首条 |
-| reference_text | 当前台词之前的真实中文上文；省略或空字符串表示无引用 | 加“只用于理解并承接语境与情绪，不朗读”说明，合入 context_texts 首条 |
+| reference_text | 当前台词之前的真实中文或中英混读上文；省略或空字符串表示无引用 | 加“只用于理解并承接语境与情绪，不朗读”说明，合入 context_texts 首条 |
 | explicit_dialect | 官方方言代码；省略或空字符串表示随音色默认 | additions.explicit_dialect |
 | speech_rate | -50～100 的整数；0 正常，-50 为 0.5 倍速，100 为 2 倍速 | audio_params.speech_rate |
 
@@ -161,9 +161,9 @@ uv run scripts/tts.py prepare --text-file 原稿.txt --voice S_xWSg2NNT1 --resou
 {"pronunciation_dict":{"tone":["北京/(bei3)(jing1)","123/一百二十三"]}}
 ```
 
-本工具只做中文：原词限 1～9 个中文或数字字符，转写目标须为中文，目标文本本地上限 500 字。规则原词不可重复，合并后最多 5000 条；与位置注音对同一词的相反规则会报错。补充字典不自动把多音字候选标为已校对。按实际提交文本模拟贪心最长匹配，检查全部已校对位置：转写跨到已校对位置时，本工具要求等长且替代字读音唯一、符合目标；不同长度需先明确口播改写并重新校对。只涉及数字等无位置注音的部分允许不同长度转写。
+本工具支持中英混读：原词限 1～9 字符且不能有空格，可包含中文、英文、数字与型号标点，文本转写目标可为中英文，目标文本本地上限 500 字。括号规则仅按普通话拼音验证，不当作英语音素语法。规则原词不可重复，合并后最多 5000 条；与位置注音对同一词的相反规则会报错。补充字典不自动把多音字候选标为已校对。按实际提交文本模拟贪心最长匹配，检查全部已校对位置：转写跨到已校对位置时，本工具要求等长且替代字读音唯一、符合目标；不同长度需先明确口播改写并重新校对。只涉及数字等无位置注音的部分允许不同长度转写。
 
-服务端字典对本请求中所有匹配原词生效，`req_params.text` 保持原稿；客户端 `spoken_alias` 按单个位置替字，实际提交文本已经变化。两者都在阅读稿中显示，不能混称。英文转写示例属于官方接口能力，本中文 skill 不接入英文。
+服务端字典对本请求中所有匹配原词生效，`req_params.text` 保持原稿；客户端 `spoken_alias` 按单个位置替字，实际提交文本已经变化。两者都在阅读稿中显示，不能混称。官方英文转写示例 `omg/oh my god` 已由本工具接入；配置表中的缩写与型号使用同一机制，品牌英语提示则通过指令传入。详见 [中英混读与发音表](mixed-language.md)。
 
 用户已明确 SSML 在其实际场景不可用。本 skill 不使用 SSML，也不把它列为纠音后备；停顿使用本地音频编排，读音可以保持原生、使用字典、指令，或已授权的可听别名加指令。
 

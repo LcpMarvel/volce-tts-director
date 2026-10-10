@@ -801,6 +801,178 @@ def timestamp_review_checks():
         raise AssertionError("timestamp_review_checks 回归失败：\n" + "\n".join(failures))
 
 
+def mixed_checks():
+    text = "Anthropic 发布 Claude Haiku 5.5，输入每百万 token 零点一美元，比 DeepSeek V4.1-Flash 还便宜。"
+    voice = "zh_male_youyoujunzi_uranus_bigtts"
+    table = tts.load_pronunciations(tts.PRONUNCIATIONS)
+    draft = tts.prepare(text, voice)
+    clip = draft["clips"][0]
+    assert clip["text"] == text and clip["voice"] == voice
+    assert tts.resolve_resource(clip) == "seed-tts-2.0"
+    assert all(text[r["start"]:r["start"] + len(r["text"])] == r["text"] for r in clip["readings"])
+    fails(lambda: tts.validate(draft, True), "混读不能绕过中文校对")
+    for row in clip["readings"]:
+        row["status"] = "reviewed"
+    clip["reference_text"] = "上文讨论 OpenAI API，不朗读引用。"
+    tts.validate(draft, True)
+    body = tts.request_body(clip, pronunciation_table=table)
+    additions = json.loads(body["req_params"]["additions"])
+    assert body["req_params"]["text"] == text
+    assert body["req_params"]["audio_params"]["enable_subtitle"] is True
+    assert additions["explicit_language"] == "zh-cn"
+    assert table["decimal_point"] == "点", "面向中文用户默认中文型号读法"
+    assert additions["pronunciation_dict"]["tone"] == ["5.5/5点5", "V4.1/V 4点1"]
+    context = additions["context_texts"]
+    assert len(context) == 1 and all(hint in context[0] for hint in ("an-THROP-ik", "klawd", "HIGH-koo"))
+    assert "API/A P I" not in body["req_params"]["additions"], "引用中的缩写不控制正文"
+    assert "ssml" not in body["req_params"] and "phoneme" not in additions
+    assert all(word not in additions["pronunciation_dict"]["tone"] for word in ("DeepSeek", "token"))
+    dot = copy.deepcopy(table)
+    dot["decimal_point"] = "point"
+    dot_body = tts.request_body(clip, pronunciation_table=dot)
+    assert json.loads(dot_body["req_params"]["additions"])["pronunciation_dict"]["tone"] == ["5.5/five point five", "V4.1/V four point one"]
+    assert dot_body["req_params"]["text"] == text
+    inactive = copy.deepcopy(table)
+    inactive["words"]["Unused"] = "unused"
+    inactive["acronyms"]["CPU"] = "C P U"
+    inactive["models"].append("V2.0")
+    inactive["words"] = dict(reversed(list(inactive["words"].items())))
+    assert tts.request_body(clip, pronunciation_table=inactive) == body
+    assert tts.request_fingerprint(body, "seed-tts-2.0") != tts.request_fingerprint(dot_body, "seed-tts-2.0")
+    legacy = copy.deepcopy(draft)
+    del legacy["pronunciation_table"]
+    assert "pronunciation_dict" not in json.loads(tts.request_body(legacy["clips"][0])["req_params"]["additions"])
+    aliases = "KV API MLA GPU IPO S-1 KV cache OpenAI OpenRouter token"
+    acronym = {"text": aliases, "voice": voice, "readings": []}
+    acronym_body = tts.request_body(acronym, pronunciation_table=table)
+    assert acronym_body["req_params"]["text"] == aliases
+    assert json.loads(acronym_body["req_params"]["additions"])["pronunciation_dict"]["tone"] == [
+        key + "/" + value for key, value in sorted(table["acronyms"].items())]
+    assert tts.prepare("Claude 5.5")["clips"][0]["explicit_language"] == "en"
+    assert tts.prepare("5.5")["clips"][0]["text"] == "5.5"
+    assert "pronunciation_table" not in tts.prepare("价格5.5美元。"), "纯中文价格不自动改为英语"
+    assert "pronunciation_table" in tts.prepare("价格5.5美元。", pronunciation_table=table)
+    for invalid in ("", "   ", "日本語カナ", "中文 Русский", "中文 Ελληνικά"):
+        fails(lambda: tts.prepare(invalid), "不宣称支持未知语种或空稿")
+    for phrase in ("API OpenAPI", "KV KValue", "S-1 S-10", "5.5 15.5"):
+        bad = {"text": phrase, "voice": voice, "readings": []}
+        fails(lambda: tts.request_body(bad, pronunciation_table=table), "全局词典不能误改子串")
+    embedded = {"text": "OpenAPI KValue S-10 15.5", "voice": voice, "readings": []}
+    assert "pronunciation_dict" not in json.loads(tts.request_body(embedded, pronunciation_table=table)["req_params"]["additions"])
+    extended = copy.deepcopy(table)
+    extended["decimal_point"] = "point"
+    extended["models"].append("15.5")
+    assert tts.table_controls({"text": "5.5 15.5"}, extended)[0]["15.5"] == "fifteen point five"
+    tts.readings({"text": "5.5 15.5"}, pronunciation_table=extended)
+    assert tts.table_controls({"text": "中文API接口"}, table)[0] == {"API": "A P I"}
+    conflict = {"text": "API", "voice": voice, "pronunciation_dict": {"tone": ["API/another word"]}}
+    fails(lambda: tts.request_body(conflict, pronunciation_table=table), "发音表与手工词典不静默覆盖")
+    conflict["pronunciation_dict"]["tone"] = ["API/A P I"]
+    assert len(json.loads(tts.request_body(conflict, pronunciation_table=table)["req_params"]["additions"])["pronunciation_dict"]["tone"]) == 1
+    raw = {"text": "omg", "voice": voice, "pronunciation_dict": {"tone": ["omg/oh my god"]}}
+    assert tts.request_body(raw)["req_params"]["text"] == "omg"
+    for entries in (["OpenRouter/router"], ["KV cache/cache"], ["API/A/P/I"], ["API/"], ["API/(bogus1)"]):
+        raw["pronunciation_dict"]["tone"] = entries
+        fails(lambda: tts.request_body(raw), "遵守官方字典长度与语法")
+    for field, value in (("version", True), ("words", []), ("words", {"Claude": "克劳德"}),
+                         ("acronyms", {"LONGACRONYM": "L"}), ("models", ["V4.1", "V4.1"]),
+                         ("models", ["V123456.78"]), ("models", ["V4"]), ("decimal_point", "dot")):
+        bad = copy.deepcopy(table)
+        bad[field] = value
+        fails(lambda: tts.validate_pronunciations(bad), "发音表类型与范围校验")
+    bad = copy.deepcopy(table)
+    bad["extra"] = True
+    fails(lambda: tts.validate_pronunciations(bad), "拒绝未知表字段")
+    bad = copy.deepcopy(table)
+    bad["words"]["API"] = None
+    fails(lambda: tts.validate_pronunciations(bad), "同词不同通道冲突")
+    bad_plan = copy.deepcopy(draft)
+    bad_plan["clips"][0]["explicit_language"] = "en"
+    fails(lambda: tts.validate(bad_plan), "混读不能强制纯英语")
+    for language in ("zh", "cn", [], True):
+        bad_plan["clips"][0]["explicit_language"] = language
+        fails(lambda: tts.validate(bad_plan), "只接受官方语言枚举")
+    assert tts.sentence_ends("Claude 5.5. DeepSeek V4.1-Flash! API?") == [11, 32, 37]
+    assert tts.sentence_ends("Dr. Smith uses V4.1. Next.") == [20, 26]
+    assert tts.sentence_ends("OpenAI e.g. API. Claude.") == [16, 24]
+    assert tts.english_integer("20") == "twenty"
+    assert tts.english_integer("1234") == "one thousand two hundred thirty four"
+    assert tts.english_integer("0004") == "zero zero zero four"
+    hint_changed = copy.deepcopy(table)
+    hint_changed["words"]["Claude"] = "KLAWD"
+    assert tts.request_body(clip, pronunciation_table=hint_changed) != body
+    unrestricted = copy.deepcopy(table)
+    unrestricted["words"]["OpenRouter"] = "open router"
+    assert "open router" in tts.request_body({"text": "OpenRouter", "voice": voice},
+                                           pronunciation_table=unrestricted)["req_params"]["additions"]
+    safe_han = {"text": "银行 API", "voice": voice, "readings": [
+        {"start": 0, "text": "银行", "pinyin": ["yin2", "hang2"], "status": "reviewed", "delivery": "native"}],
+        "pronunciation_dict": {"tone": ["银行/AB"]}}
+    fails(lambda: tts.request_body(safe_han, pronunciation_table=table), "英文转写不能伪装成汉字读音")
+    long = ("Claude Haiku 5.5. " * 60)
+    assert "".join(c["text"] for c in tts.prepare(long)["clips"]) == long
+    subtitle_text = "Anthropic 发布 Claude Haiku 5.5。DeepSeek V4.1-Flash!"
+    labels = ["Anthropic", "发", "布", "Claude", "Haiku", "5.5。", "DeepSeek", "V4.1-Flash!"]
+    words = [{"word": label, "startTime": i / 2, "endTime": (i + 1) / 2, "confidence": 0.9}
+             for i, label in enumerate(labels)]
+    data = tts.subtitle_data([{"text": subtitle_text, "words": words}], subtitle_text, 4)
+    assert data["words"] == words and len(data["sentences"]) == 2
+    assert [cue["endTime"] for cue in data["sentences"]] == [3.0, 4.0]
+    supplier_text = "API 调用。"
+    supplier_words = [{"word": "A P I", "startTime": 0, "endTime": 1, "confidence": 0.9},
+                      {"word": "调用。", "startTime": 1, "endTime": 2, "confidence": 0.9}]
+    assert tts.subtitle_data([{"text": supplier_text, "words": supplier_words}], supplier_text, 2)["words"] == supplier_words
+    with tempfile.TemporaryDirectory(prefix="volce-mixed-check-") as directory:
+        out = Path(directory)
+        tts.preview(draft, out / "preview")
+        shown = (out / "preview/director.md").read_text()
+        assert all(value in shown for value in ("Anthropic", "an-THROP-ik", "英语原生读法", "服务端文本转写", "zh-cn"))
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+                tts.urllib.request, "build_opener", side_effect=AssertionError("dry-run 不能联网")):
+            assert tts.render(draft, out / "dry", dry_run=True)["clips"] == 1
+        assert json.loads((out / "dry/requests.json").read_text()) == [body]
+        duplicate = out / "duplicate.json"
+        duplicate.write_text('{"version":1,"version":1}')
+        fails(lambda: tts.load_pronunciations(duplicate), "JSON 重复字段不可悄悄丢弃")
+        profile = out / "pronunciations.json"
+        tts.save(profile, table)
+        snapshot = tts.prepare(text, voice, pronunciation_table=tts.load_pronunciations(profile))
+        tts.save(profile, dot)
+        assert snapshot["pronunciation_table"]["decimal_point"] == "点"
+        pcm = b"\x00\x00" * (24000 * 4)
+        frames = [json.dumps({"code": 0, "data": base64.b64encode(pcm).decode()}),
+                  json.dumps({"code": 20000000}), json.dumps({"code": 0, "sentence": {"text": subtitle_text, "words": words}})]
+        class Response(io.BytesIO):
+            headers = {"X-Tt-Logid": "offline-mixed"}
+        class Opener:
+            def open(self, request, timeout):
+                assert json.loads(request.data) == body
+                return Response("\n".join(frames).encode())
+        with patch.dict(os.environ, {"VOLC_TTS_API_KEY": "offline-fake-key"}, clear=True), patch.object(
+                tts.urllib.request, "build_opener", return_value=Opener()) as network:
+            summary = tts.render(draft, out / "audio")
+            assert summary["timestamps"] is True and network.call_count == 1
+            draft["clips"][0]["pause_after_ms"] = 250
+            tts.render(draft, out / "audio")
+            assert network.call_count == 1
+        sidecar = next((out / "audio").glob("*.words.json"))
+        assert json.loads(sidecar.read_text())["words"] == words
+        timeline = json.loads((out / "audio/timeline.json").read_text())
+        assert timeline["duration"] == 4.25 and timeline["clips"][0]["text"] == text
+        assert all({k: w[k] for k in words[i]} == words[i] for i, w in enumerate(timeline["words"]))
+        assert "DeepSeek" in (out / "audio/final.srt").read_text()
+        segments = [{"clip": {**clip, "id": ident}, "frames": 24000 * 4, "audio": "clip.wav",
+                     "words_file": "clip.words.json", "subtitles": data, "timestamps_reason": ""}
+                    for ident in ("001", "002")]
+        shifted = tts.build_timeline(segments)
+        assert shifted["clips"][1]["offset"] == 4.25 and shifted["duration"] == 8.5
+        for original, shifted_word in zip(words, shifted["words"][len(words):]):
+            assert shifted_word["word"] == original["word"] and shifted_word["confidence"] == original["confidence"]
+            assert shifted_word["startTime"] == original["startTime"] + 4.25
+            assert shifted_word["endTime"] == original["endTime"] + 4.25
+        assert all("offline-fake-key" not in f.read_text() for f in (out / "audio").glob("*.json"))
+
+
 def demo():
     plan = json.loads((ROOT / "examples/chinese/plan.json").read_text(encoding="utf-8"))
     text = "".join(c["text"] for c in plan["clips"])
@@ -841,7 +1013,7 @@ def demo():
     assert expressive_body["audio_params"]["speech_rate"] == -10
     assert expressive_additions["explicit_dialect"] == "beijing"
     for name, value in (("reference_text", []), ("reference_text", "中" * 501),
-                        ("reference_text", "English 上文"), ("explicit_dialect", "unknown"),
+                        ("reference_text", "Русский 上文"), ("explicit_dialect", "unknown"),
                         ("explicit_dialect", []), ("section_id", 12)):
         bad_control = copy.deepcopy(expressive)
         bad_control["clips"][0][name] = value
@@ -908,7 +1080,7 @@ def demo():
         {"start": 0, "text": "重", "pinyin": ["zhong4"], "status": "reviewed"},
         {"start": 1, "text": "重重", "pinyin": ["chong2", "chong2"], "status": "reviewed"}]}
     fails(lambda: tts.readings(shadow, True), "最长匹配必须符合位置标注")
-    fails(lambda: tts.prepare("Hello 中文"), "不隐式做英文")
+    assert tts.prepare("Hello 中文")["clips"][0]["text"] == "Hello 中文"
     fails(lambda: tts.prepare("中" * 501), "不截断长句")
     pcm = b"\x01\x00" * 240
     frames = [json.dumps({"code": 0, "data": base64.b64encode(pcm).decode()}).encode(),
@@ -969,7 +1141,8 @@ def demo():
     clone_checks(plan, frames, pcm)
     timestamp_checks()
     timestamp_review_checks()
-    print("PASS：中文校对、原文保留、纠音冲突、语音指令与引用上文、方言、断流、预览、预置/克隆资源接线、WAV与新旧缓存、字幕晚到与脱敏、逐字时间线、句级 SRT、字幕开关与降级、十项时间戳评审回归")
+    mixed_checks()
+    print("PASS：中文校对、中英混读、发音表/品牌提示/缩写/型号、原文与英语词时间戳保留、纠音冲突、语音指令与引用上文、方言、断流、预览、预置/克隆资源接线、WAV与新旧缓存、字幕晚到与脱敏、逐字时间线、句级 SRT、字幕开关与降级、十项时间戳评审回归")
 
 
 if __name__ == "__main__":

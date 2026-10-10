@@ -3,7 +3,7 @@
 # requires-python = ">=3.10"
 # dependencies = ["pypinyin==0.55.0"]
 # ///
-"""中文校对、阅读稿和火山 TTS；preview/prepare/dry-run 均不访问网络。"""
+"""中英混读、中文校对、阅读稿和火山 TTS；preview/prepare/dry-run 均不访问网络。"""
 import argparse
 import base64
 import hashlib
@@ -27,6 +27,8 @@ from pypinyin.constants import PINYIN_DICT
 
 ENDPOINT = "https://openspeech.bytedance.com/api/v3/tts/unidirectional"
 VOICE = "zh_female_vv_uranus_bigtts"
+PRONUNCIATIONS = Path(__file__).resolve().parents[1] / "references/pronunciations.json"
+DIGITS = ("zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine")
 PCM_CHUNK_FRAMES = 24000
 DIALECTS = {"beijing": "北京话", "dongbei": "东北话", "henan": "河南话", "shaanxi": "陕西话",
             "shanghai": "上海话", "sichuan": "四川话", "tianjin": "天津话", "yue": "粤语"}
@@ -43,10 +45,28 @@ def save(path, value):
 
 
 def check_text(text):
-    if not isinstance(text, str) or not HAN.search(text):
-        raise ValueError("稿件必须包含中文")
-    if any(c.isalpha() and not HAN.fullmatch(c) for c in text):
-        raise ValueError("只做中文；请先明确外文或缩写的中文口播方式")
+    if not isinstance(text, str) or not (HAN.search(text) or re.search(r"[A-Za-z0-9]", text)):
+        raise ValueError("文本须包含中文、英文或数字")
+    if any(c.isalpha() and not (HAN.fullmatch(c) or re.fullmatch(r"[A-Za-z]", c)) for c in text):
+        raise ValueError("当前支持中文与英文；其他语言须先核实音色能力")
+
+
+def sentence_ends(text):
+    ends = []
+    for match in re.finditer(r'[。！？!?]+["”’」』）】]*|\n+|\.+["”’」』）】]*', text):
+        if match.group().startswith("."):
+            # 小数、型号、URL 和常见缩写内部的点不是句末；英文句末须有空白或 EOF。
+            if match.end() < len(text) and not text[match.end()].isspace():
+                continue
+            before = text[:match.start()]
+            word = re.search(r"[A-Za-z.]+$", before)
+            if word and (word.group().lower() in {"mr", "mrs", "ms", "dr", "prof", "vs", "etc", "e.g", "i.e"}
+                         or re.fullmatch(r"(?:[A-Za-z]\.)*[A-Za-z]", word.group())):
+                continue
+        ends.append(match.end())
+    if not ends or ends[-1] != len(text):
+        ends.append(len(text))
+    return ends
 
 
 def scan(text):
@@ -66,7 +86,111 @@ def scan(text):
     return rows
 
 
-def readings(clip, complete=False):
+def validate_pronunciations(table):
+    if table is None:
+        return
+    if (not isinstance(table, dict) or set(table) != {"version", "words", "acronyms", "models", "decimal_point"}
+            or type(table["version"]) is not int or table["version"] != 1):
+        raise ValueError("发音表须包含 version=1、words、acronyms、models、decimal_point")
+    if not isinstance(table["words"], dict) or not isinstance(table["acronyms"], dict):
+        raise ValueError("words 与 acronyms 须为对象")
+    for word, hint in table["words"].items():
+        if not isinstance(word, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,127}", word):
+            raise ValueError("英语提示词须为不含空格的英文词或型号")
+        if hint is not None and (not isinstance(hint, str) or not 1 <= len(hint) <= 200
+                                or not re.fullmatch(r"[ -~]+", hint) or not re.search(r"[A-Za-z]", hint)):
+            raise ValueError("英语读音提示须为英文字符串或 null（原生读法），不使用中文音译")
+    for word, target in table["acronyms"].items():
+        if not isinstance(word, str) or not re.fullmatch(r"[A-Z][A-Z0-9-]{0,8}", word):
+            raise ValueError("缩写原词须为 1～9 个大写英文、数字或短横线字符")
+        if (not isinstance(target, str) or not 1 <= len(target) <= 500
+                or not re.fullmatch(r"[A-Za-z0-9 .'-]+", target) or not re.search(r"[A-Za-z]", target)):
+            raise ValueError("缩写目标须为英文逐字母读法，不使用中文音译")
+    models = table["models"]
+    if not isinstance(models, list) or any(not isinstance(word, str) or not 1 <= len(word) <= 9
+            or not re.fullmatch(r"[Vv]?[0-9]+(?:\.[0-9]+)+", word) for word in models):
+        raise ValueError("models 须为最多 9 字符的点分数字型号数组，可带 V/v 前缀")
+    if len(set(models)) != len(models):
+        raise ValueError("型号不可重复")
+    if set(table["words"]) & (set(table["acronyms"]) | set(models)):
+        raise ValueError("同词不能同时设置英语提示和缩写/型号转写")
+    if table["decimal_point"] not in ("point", "点"):
+        raise ValueError("decimal_point 只能为 point 或 点")
+    if len(table["words"]) + len(table["acronyms"]) + len(models) > 5000:
+        raise ValueError("发音表最多 5000 项")
+
+
+def token_starts(text, word, model=False):
+    boundary = r"[A-Za-z0-9_.]" if model else r"[A-Za-z0-9_]"
+    return {match.start() for match in re.finditer(
+        rf"(?<!{boundary}){re.escape(word)}(?!{boundary})", text)}
+
+
+def english_integer(digits):
+    if len(digits) > 1 and digits.startswith("0"):
+        return " ".join(DIGITS[int(digit)] for digit in digits)
+    number = int(digits)
+    small = DIGITS + ("ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen",
+                      "sixteen", "seventeen", "eighteen", "nineteen")
+    if number < 20:
+        return small[number]
+    if number < 100:
+        tens, rest = divmod(number, 10)
+        return ("twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety")[tens - 2] + (
+            " " + small[rest] if rest else "")
+    for divisor, label in ((1000000, "million"), (1000, "thousand"), (100, "hundred")):
+        if number >= divisor:
+            first, rest = divmod(number, divisor)
+            return english_integer(str(first)) + " " + label + (" " + english_integer(str(rest)) if rest else "")
+
+
+def table_controls(clip, table):
+    validate_pronunciations(table)
+    rules, instructions, intended = {}, [], {}
+    if table is None:
+        return rules, instructions, intended
+    text = clip["text"]
+    for word, hint in sorted(table["words"].items()):
+        if hint is not None and token_starts(text, word):
+            instructions.append(f'英文词“{word}”按英语读作 {hint}，不要读成中文音译。')
+    targets = dict(table["acronyms"])
+    for model in table["models"]:
+        parts = model.lstrip("Vv").split(".")
+        if table["decimal_point"] == "point":
+            spoken = " point ".join([english_integer(parts[0])] + [
+                " ".join(DIGITS[int(digit)] for digit in part) for part in parts[1:]])
+        else:
+            spoken = "点".join(parts)
+        targets[model] = (model[0] + " " if model[0] in "Vv" else "") + spoken
+    for word, target in sorted(targets.items()):
+        starts = token_starts(text, word, word in table["models"])
+        if starts:
+            rules[word], intended[word] = target, starts
+    if any(word in rules for word in table["acronyms"]):
+        instructions.append("缩写按英文逐个字母读，保留字母与数字之间的自然衔接。")
+    return rules, instructions, intended
+
+
+def check_table_matches(text, rules, intended):
+    if not intended:
+        return
+    matched, i = {word: set() for word in intended}, 0
+    while i < len(text):
+        matches = [word for word in rules if text.startswith(word, i)]
+        if not matches:
+            i += 1
+            continue
+        word = max(matches, key=len)
+        if word in intended:
+            if i not in intended[word]:
+                raise ValueError(f"发音规则 {word} 会误改另一词或型号的子串；明确完整词组或拆段")
+            matched[word].add(i)
+        i += len(word)
+    if matched != intended:
+        raise ValueError("更长发音字典规则覆盖了混读规则；明确完整词组或拆段")
+
+
+def readings(clip, complete=False, pronunciation_table=None):
     text = clip["text"]
     occupied, reviewed, expected, rules = set(), set(), {}, {}
     rows = sorted(clip.get("readings", []), key=lambda r: r["start"])
@@ -121,8 +245,9 @@ def readings(clip, complete=False):
         if not isinstance(entry, str) or entry.count("/") != 1:
             raise ValueError("发音字典规则须为 原词/修正内容")
         word, target = entry.split("/")
-        if not 1 <= len(word) <= 9 or any(not (HAN.fullmatch(c) or c.isdecimal()) for c in word) or word in seen:
-            raise ValueError("字典原词须为 1～9 个中文或数字字符，且不可重复")
+        if not 1 <= len(word) <= 9 or any(c.isspace() for c in word) or word in seen:
+            raise ValueError("字典原词须为 1～9 字符、不含空格，且不可重复")
+        check_text(word)
         seen.add(word)
         if target.startswith("("):
             sounds = re.findall(r"\(([a-zv]+[1-5])\)", target)
@@ -138,8 +263,14 @@ def readings(clip, complete=False):
         if word in rules and rules[word] != value:
             raise ValueError("手工字典与位置标注对同一词设置了不同规则")
         rules[word] = value
+    generated, _, intended = table_controls(clip, pronunciation_table)
+    for word, target in generated.items():
+        if word in rules and rules[word] != target:
+            raise ValueError(f"发音表与片段字典规则冲突：{word}")
+        rules[word] = target
     if len(rules) > 5000:
         raise ValueError("发音字典最多 5000 个词条")
+    check_table_matches(text, rules, intended)
     if complete:
         missing = [r for r in scan(text) if r["start"] not in reviewed]
         if missing:
@@ -176,7 +307,7 @@ def readings(clip, complete=False):
                     if len(value) != len(word) and any(j in reviewed for j in range(i, i + len(word))):
                         raise ValueError("不同长度文本转写与位置注音相交；先明确口播改写再校对")
                     choices = [pinyin(c, style=Style.TONE3, heteronym=True, neutral_tone_with_five=True)[0]
-                               for c in value]
+                               if HAN.fullmatch(c) else [] for c in value]
                     value = [sounds[0] if len(sounds) == 1 else None for sounds in choices]
                 actual.update(zip(range(i, i + len(word)), value))
                 i += len(word)
@@ -212,6 +343,8 @@ def request_fingerprint(body, resource):
 
 
 def validate(plan, complete=False):
+    table = plan.get("pronunciation_table")
+    validate_pronunciations(table)
     if "enable_subtitle" in plan and type(plan["enable_subtitle"]) is not bool:
         raise ValueError("enable_subtitle 必须为布尔值")
     clips = plan.get("clips")
@@ -246,10 +379,30 @@ def validate(plan, complete=False):
         for name in ("enable_subtitle", "enable_latex_tn"):
             if name in clip and type(clip[name]) is not bool:
                 raise ValueError(f"{name} 必须为布尔值")
-        readings(clip, complete)
+        language = clip.get("explicit_language")
+        if language is not None and language not in ("zh-cn", "en"):
+            raise ValueError("explicit_language 只能为 zh-cn（中英混读）或 en（英语）")
+        if language == "en" and HAN.search(clip["text"]):
+            raise ValueError("包含中文的片段须使用 zh-cn 或省略 explicit_language")
+        readings(clip, complete, table)
 
 
-def prepare(text, voice=VOICE, resource_id=None):
+def load_pronunciations(path):
+    def unique(pairs):
+        result = {}
+        for name, value in pairs:
+            if name in result:
+                raise ValueError(f"发音表 JSON 字段重复：{name}")
+            result[name] = value
+        return result
+    table = json.loads(Path(path).read_text(encoding="utf-8"), object_pairs_hook=unique)
+    if table is None:
+        raise ValueError("发音表文件须为对象，不能为 null")
+    validate_pronunciations(table)
+    return table
+
+
+def prepare(text, voice=VOICE, resource_id=None, pronunciation_table=None):
     selection = {"voice": voice}
     if resource_id is not None:
         selection["resource_id"] = resource_id
@@ -257,7 +410,9 @@ def prepare(text, voice=VOICE, resource_id=None):
     check_text(text)
     # ponytail: 500 字保守本地上限；需要更长连续朗读时核实账号与模型限制后调整。
     parts, current = [], ""
-    for sentence in re.findall(r"[^。！？\n]*[。！？\n]|[^。！？\n]+$", text):
+    start = 0
+    for end in sentence_ends(text):
+        sentence, start = text[start:end], end
         if len(sentence) > 500:
             raise ValueError("有超过 500 字的连续句子，请明确分段")
         if len(current) + len(sentence) > 500:
@@ -272,10 +427,24 @@ def prepare(text, voice=VOICE, resource_id=None):
               "direction": "自然、清楚的普通话朗读" if resource == "seed-tts-2.0" else "",
               "reference_text": "", "speech_rate": 0,
               "pause_after_ms": 0, "readings": scan(part)} for i, part in enumerate(parts, 1)]
+    if re.search(r"[A-Za-z]", text):
+        language = "zh-cn" if HAN.search(text) else "en"
+        for clip in clips:
+            clip["explicit_language"] = language
+            if resource == "seed-tts-2.0":
+                clip["direction"] = ("自然、清楚的普通话讲述，英文词按英语发音，中英衔接连贯，不逐字停顿。"
+                                     if language == "zh-cn" else "自然、清楚的英语朗读。")
     if resource_id is not None or resource == "seed-icl-2.0":
         for clip in clips:
             clip["resource_id"] = resource
-    return {"title": "中文阅读", "clips": clips}
+    table = pronunciation_table
+    if table is None and re.search(r"[A-Za-z]", text):
+        table = load_pronunciations(PRONUNCIATIONS)
+    validate_pronunciations(table)
+    plan = {"title": "中英阅读" if re.search(r"[A-Za-z]", text) else "中文阅读", "clips": clips}
+    if table is not None:
+        plan["pronunciation_table"] = json.loads(json.dumps(table))
+    return plan
 
 
 def preview(plan, out):
@@ -284,7 +453,10 @@ def preview(plan, out):
     title = str(plan.get("title", "中文阅读"))
     md, sections = [f"# {title}\n\n读音为校对标注，不进入口播。待校对项尚未确定。\n"], []
     for clip in plan["clips"]:
-        rows, _ = readings(clip)
+        rows, _ = readings(clip, pronunciation_table=plan.get("pronunciation_table"))
+        mixed_rules, hints, _ = table_controls(clip, plan.get("pronunciation_table"))
+        native = [word for word, hint in plan.get("pronunciation_table", {}).get("words", {}).items()
+                  if hint is None and token_starts(clip["text"], word)] if plan.get("pronunciation_table") else []
         # 即使手工删掉标注，预览仍展示遗漏候选。
         covered = {i for r in rows for i in range(r["start"], r["start"] + len(r["text"]))}
         rows += [r for r in scan(clip["text"]) if r["start"] not in covered]
@@ -319,7 +491,11 @@ def preview(plan, out):
                     ("语速参数", str(clip.get("speech_rate", 0))),
                     ("方言", DIALECTS.get(clip.get("explicit_dialect", ""), "随音色默认")),
                     ("段落标识", clip.get("section_id", "")),
-                    ("补充发音字典", "\n".join(clip.get("pronunciation_dict", {}).get("tone", [])))]
+                    ("补充发音字典", "\n".join(clip.get("pronunciation_dict", {}).get("tone", []))),
+                    ("语言", clip.get("explicit_language", "默认中英混读")),
+                    ("英语原生读法", "、".join(sorted(native))),
+                    ("英语读音提示（指令，须试听）", "\n".join(hints)),
+                    ("混读发音字典（服务端文本转写）", "\n".join(w + "/" + value for w, value in mixed_rules.items()))]
         md += ["\n## " + label + "\n", "".join(plain) + "\n"]
         md.extend(name + "：" + value + "\n" for name, value in controls if value)
         md.extend(details)
@@ -331,22 +507,25 @@ def preview(plan, out):
                         + "</tr></thead><tbody>" + "".join(table) + "</tbody></table></div></section>")
     (out / "director.md").write_text("".join(md), encoding="utf-8")
     page = '''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>中文阅读稿</title><style>body{max-width:1040px;margin:40px auto;padding:0 24px;color:#203038;background:#f7f5ef;font-family:system-ui,sans-serif}section{background:white;border:1px solid #deded5;border-radius:12px;padding:24px;margin:24px 0}h2{font-size:15px;color:#526369}.script{font-size:23px;line-height:2.5;white-space:pre-wrap}ruby.reviewed{background:#e3f1e9}ruby.pending{background:#ffe8b4}rt{font-size:12px;color:#435d59}table{border-collapse:collapse;width:100%;font-size:13px}td,th{text-align:left;padding:10px;border-bottom:1px solid #eee}.table{overflow:auto}button{padding:8px 16px;cursor:pointer}.hide rt{visibility:hidden}@media(max-width:600px){body{padding:0 12px}section{padding:16px}}</style>
-<h1>''' + html.escape(title) + '''</h1><p>中文阅读稿 · 黄色待校对，绿色已校对。注音与导演说明不进入口播。本页不证明已生成音频。</p>
+<title>中英阅读稿</title><style>body{max-width:1040px;margin:40px auto;padding:0 24px;color:#203038;background:#f7f5ef;font-family:system-ui,sans-serif}section{background:white;border:1px solid #deded5;border-radius:12px;padding:24px;margin:24px 0}h2{font-size:15px;color:#526369}.script{font-size:23px;line-height:2.5;white-space:pre-wrap}ruby.reviewed{background:#e3f1e9}ruby.pending{background:#ffe8b4}rt{font-size:12px;color:#435d59}table{border-collapse:collapse;width:100%;font-size:13px}td,th{text-align:left;padding:10px;border-bottom:1px solid #eee}.table{overflow:auto}button{padding:8px 16px;cursor:pointer}.hide rt{visibility:hidden}@media(max-width:600px){body{padding:0 12px}section{padding:16px}}</style>
+<h1>''' + html.escape(title) + '''</h1><p>中英阅读稿 · 黄色待校对，绿色已校对。注音与导演说明不进入口播。本页不证明已生成音频。</p>
 <button onclick="document.body.classList.toggle('hide')">显示／隐藏注音</button>''' + "".join(sections) + "</html>"
     (out / "director.html").write_text(page, encoding="utf-8")
 
 
-def request_body(clip, enable_subtitle=None):
+def request_body(clip, enable_subtitle=None, pronunciation_table=None):
     if enable_subtitle is None:
         enable_subtitle = clip.get("enable_subtitle", True)
     if type(enable_subtitle) is not bool:
         raise ValueError("enable_subtitle 必须为布尔值")
     # 官方不支持方言及 LaTeX 文本规范化请求的字幕，保留音频合成并降级。
     enable_subtitle = enable_subtitle and not clip.get("explicit_dialect") and not clip.get("enable_latex_tn", False)
-    rows, rules = readings(clip, complete=True)
+    rows, rules = readings(clip, complete=True, pronunciation_table=pronunciation_table)
+    _, hints, _ = table_controls(clip, pronunciation_table)
     text, instructions = list(clip["text"]), []
     additions = {"disable_markdown_filter": True}
+    if clip.get("explicit_language"):
+        additions["explicit_language"] = clip["explicit_language"]
     if rules:
         additions["pronunciation_dict"] = {"tone": [w + "/" + (sounds if isinstance(sounds, str)
                                                    else "".join("(" + s + ")" for s in sounds))
@@ -370,6 +549,8 @@ def request_body(clip, enable_subtitle=None):
         if delivery in ("instruction", "spoken_alias"):
             target = row.get("spoken_alias", row["text"])
             instructions.append(f'发音要求：原文“{row["text"]}”，本次提交的“{target}”读作 {" ".join(row["pinyin"])}。')
+    if hints:
+        instructions.append("以下仅为发音提示，不朗读提示本身：\n" + "\n".join(hints))
     if instructions:
         # 全部说明合入首条，避免后续指令被忽略。
         additions["context_texts"] = ["\n".join(instructions)]
@@ -496,10 +677,7 @@ def sentence_cues(text, words):
     if not words:
         return []
     spans = align_word_spans(text, words)
-    boundaries = [0] + [part.end() for part in re.finditer(
-        r'.+?(?:[。！？]+["”’」』）】]*|\n+|$)', text, re.S)]
-    if boundaries[-1] != len(text):
-        boundaries.append(len(text))
+    boundaries = [0] + sentence_ends(text)
     # 未对齐的规范化字词只用相邻真实文字锚点定位；跨界或无锚点则合并字幕。
     for i, span in enumerate(spans):
         if span is None:
@@ -804,7 +982,7 @@ def render(plan, out, dry_run=False, retry_uncertain=False, timestamps=None, deb
     if timestamps is not None and type(timestamps) is not bool:
         raise ValueError("timestamps 必须为布尔值")
     jobs = [(clip, request_body(clip, timestamps if timestamps is not None else
-             clip.get("enable_subtitle", plan.get("enable_subtitle", True))), resolve_resource(clip))
+             clip.get("enable_subtitle", plan.get("enable_subtitle", True)), plan.get("pronunciation_table")), resolve_resource(clip))
             for clip in plan["clips"]]
     routes = [{"clip": clip["id"], "speaker": clip["voice"], "resource_id": resource,
                "endpoint": ENDPOINT} for clip, _, resource in jobs]
@@ -913,6 +1091,8 @@ def main():
     prep.add_argument("--text-file", type=Path, required=True)
     prep.add_argument("--voice", default=VOICE)
     prep.add_argument("--resource-id", choices=("seed-tts-2.0", "seed-icl-2.0"))
+    prep.add_argument("--pronunciation-table", type=Path,
+                      help="中英发音表 JSON；快照写入计划，含英文稿默认使用随 skill 安装的表")
     prep.add_argument("--out", type=Path, required=True)
     for command in ("preview", "render"):
         cmd = sub.add_parser(command)
@@ -927,7 +1107,8 @@ def main():
     args = parser.parse_args()
     try:
         if args.command == "prepare":
-            plan = prepare(args.text_file.read_text(encoding="utf-8"), args.voice, args.resource_id)
+            plan = prepare(args.text_file.read_text(encoding="utf-8"), args.voice, args.resource_id,
+                           load_pronunciations(args.pronunciation_table) if args.pronunciation_table else None)
             validate(plan)
             save(args.out, plan)
             result = {"plan": str(args.out.resolve())}
