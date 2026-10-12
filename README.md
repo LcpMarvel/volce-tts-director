@@ -1,6 +1,6 @@
 # volce-tts-director · 火山引擎TTS导演
 
-当前版本：[v0.4.0](https://github.com/LcpMarvel/volce-tts-director/releases/tag/v0.4.0) · 中英混读、可配置发音表与情绪演绎模式。2026-10-12 已用一个获授权的 `S_` 音色完成 perform / TTS 协议、音频与时间线核对；用户试听后确认该冷笑样本的 perform 效果明显更好，不代表所有音色与场景均已验收。
+当前版本：[v0.4.1](https://github.com/LcpMarvel/volce-tts-director/releases/tag/v0.4.1) · 中英混读、可配置发音表与情绪演绎模式。2026-10-12 已用一个获授权的 `S_` 音色完成 perform / TTS 协议、音频与时间线核对；用户试听后确认该冷笑样本的 perform 效果明显更好，不代表所有音色与场景均已验收。
 
 把你的稿件变成有情绪、有节奏的配音成品。让 AI Agent 为中文、英文及中英混读稿件校对读音，给旁白和不同角色安排音色、情绪、重音与节奏，再通过火山引擎豆包 TTS 2.0 生成配音、字幕和字词时间戳。适用于视频旁白、产品讲解、有声故事和分角色对白。英文品牌与技术词保留原文，不自动转成中文音译。
 
@@ -82,11 +82,13 @@ uv run skills/volce-tts-director/scripts/tts.py prepare --text-file 原稿.txt -
 
 仍需完成中文校对，再 preview、dry-run 和 render。阅读稿及 dry-run 会展示合成资源，音频目录的 `routes.json` 保存无凭据的片段路由；`requests.json` 仍只保存请求体。首次试听建议只用一个短句；调用失败不自动换资源或重试。
 
-## 情绪演绎模式（v0.4.0）
+## 情绪演绎模式
+
+v0.4.0 引入情绪演绎；v0.4.1 修正音色 ID 的提示词写法，移除音频引用标记，音色只由 `references[].speaker` 指定。此次模板变更会改变 perform 请求指纹，旧模板的缓存不直接复用，重新生成前须核对费用与授权；普通 TTS 缓存不受影响。
 
 普通片段继续使用原来的 TTS 2.0 / ICL 2.0；只有标为 `mode: "perform"` 的片段改走豆包音频生成模型 1.0（`seed-audio-1.0`）。适合冷笑、哭出声、尖叫、叹气等副语言，或已有 `S_` 复刻音色的强情绪句。预置 2.0 音色的整体情绪先试 `direction`，不足再切换模式。未写 mode 的旧计划不改变请求、指纹或缓存行为。
 
-- 两种模式共用角色音色映射：片段显式 `voice` > `preview / render --voices 文件.json` 的角色映射 > 计划顶层 `voices`。CLI 文件覆盖的是映射，不覆盖片段显式音色；买家只需改映射文件，缺角色或未替换占位 ID 会报错。
+- 两种模式共用角色音色映射：片段显式 `voice` > `preview / render --voices 文件.json` 的角色映射 > 计划顶层 `voices`。CLI 文件覆盖的是映射，不覆盖片段显式音色；买家只需改映射文件，缺角色或未替换占位 ID 会报错。预置 2.0 `zh_` 与复刻 `S_` 音色均通过 `references[].speaker` 指定；**使用音色 ID 时，描述里不要写 `@音频N`**，该标记不是 speaker 音色 ID 的引用方式。
 - `perform.prompt` 写怎么演、不写台词；台词只在 `text`。`takes` 默认 1（允许 1～4），每个 take 独立调用。多 take 的 `selected_take: null` 暂用 take 1 并标为 provisional；用户试听后写回 1 起的编号，在同一输出目录重跑复用已完成缓存，仅重拼成品。
 - 默认 `ambience: false`，请求干声，但底噪、音效、加词或漏词仍需试听。不会自动选 take、裁剪静音、归一响度、重试或增加 watermark 字段；AI 内容发布标识需按目的地要求另行处理。
 - `render --only-mode perform` 可先生成演绎句；跳过的 TTS 片段若无已完成缓存，只输出片段，不生成 `final.wav`、`timeline.json` 或 `final.srt`，并移除该输出目录中由脚本管理的这三个旧成品，保留片段缓存。
@@ -102,9 +104,9 @@ uv run skills/volce-tts-director/scripts/tts.py render --plan examples/perform/p
 uv run skills/volce-tts-director/scripts/tts.py render --plan examples/perform/plan.json --voices examples/voices.example.json --out outputs/perform-buyer --dry-run
 ```
 
-**真实协议核对（2026-10-12）：**一个获授权的 `S_` 音色配合 `references[].speaker` 与 `@音频1` 请求已返回音频。perform 的 HTTP 200 响应实际**没有 code**；首次因旧严格检查停在 uncertain，用户另行明确授权一次重试后成功保存。现仅在 HTTP 200 且音频能解码为有效非空 WAV 时允许缺 code；若 code 存在，仍只接受整数 `0 / 20000000`，不接受 null、布尔、字符串或错误码。成功样本返回 24 kHz / 16-bit / 双声道 WAV，下混为单声道；字幕毫秒转秒、文字匹配及与同音色 TTS 拼接已核对。两次 perform（包括首次本地失败）加一次 TTS 共 3 次调用，perform 的 `original_duration` 合计 11.48 秒可能计费，以控制台为准。
+**真实协议核对（2026-10-12）：**一个通过 `references[].speaker` 传入的获授权 `S_` 音色已返回音频。perform 的 HTTP 200 响应实际**没有 code**；首次因旧严格检查停在 uncertain，用户另行明确授权一次重试后成功保存。现仅在 HTTP 200 且音频能解码为有效非空 WAV 时允许缺 code；若 code 存在，仍只接受整数 `0 / 20000000`，不接受 null、布尔、字符串或错误码。成功样本返回 24 kHz / 16-bit / 双声道 WAV，下混为单声道；字幕毫秒转秒、文字匹配及与同音色 TTS 拼接已核对。两次 perform（包括首次本地失败）加一次 TTS 共 3 次调用，perform 的 `original_duration` 合计 11.48 秒可能计费，以控制台为准。
 
-**试听反馈与验证边界：**用户试听后认为本次冷笑样本的 perform 效果明显优于 TTS；这不单独证明 `@音频1` 的语义绑定、音色身份/相似度或干声质量，也不保证其他场景的演绎效果。此轮未测预置 `zh_` perform 音色，后续 A/B 试听或真实调用仍须在授权范围内。新版 API 文档列 18 种语言；本工具 v0.4.0 仅接受中文、英文及中英混读，这是工具范围，不是模型限制。详见[完整字段、实测记录与待验收项](skills/volce-tts-director/references/usage.md#情绪演绎模式)。
+**试听反馈与验证边界：**用户试听后认为本次冷笑样本的 perform 效果明显优于 TTS；这不单独证明音色身份/相似度或干声质量，也不保证其他场景的演绎效果。预置 2.0 与复刻音色都使用 speaker ID，不应把描述中误用音频引用标记的请求结果当作音色不支持的证据；后续 A/B 试听或真实调用仍须在授权范围内。新版 API 文档列 18 种语言；本工具当前仅接受中文、英文及中英混读，这是工具范围，不是模型限制。详见[完整字段、实测记录与待验收项](skills/volce-tts-director/references/usage.md#情绪演绎模式)。
 
 ## 中英混读与发音表
 
@@ -172,7 +174,7 @@ uv run skills/volce-tts-director/scripts/tts.py prepare \
 
 引用上文是本工具的计划字段 `reference_text`，当前通过自然语言说明接入 `context_texts`。不同音色对指令、上文和纠音的遵循程度需要试听验证。
 
-本地当前支持中文与英文（含中英混读），普通 TTS 接入豆包 TTS 2.0 预置音色、已有的声音复刻 2.0 音色和 v3 单向 HTTP 接口；perform 另走 v3 音频生成 HTTP 接口，一个 S_ 样本已完成真实协议核对，听感及其他音色仍待验收。具体音色的英语、指令和纠音能力以官方能力表及试听为准，不仅凭 `zh_` / `S_` 前缀推断。不支持其他字母体系、录音上传/音色训练、旧代际复刻接口、SSML、原生多人联合合成或实时播放。
+本地当前支持中文与英文（含中英混读），普通 TTS 接入豆包 TTS 2.0 预置音色、已有的声音复刻 2.0 音色和 v3 单向 HTTP 接口；perform 另走 v3 音频生成 HTTP 接口，通过 speaker ID 支持预置 2.0 与已有复刻音色，一个 S_ 样本已完成真实协议核对并获得用户正面试听反馈。具体音色的英语、指令和纠音能力以官方能力表及试听为准，不仅凭 `zh_` / `S_` 前缀推断。不支持其他字母体系、录音上传/音色训练、旧代际复刻接口、SSML、原生多人联合合成或实时播放。
 
 ## 逐字时间戳与字幕
 
@@ -236,7 +238,7 @@ uv run skills/volce-tts-director/scripts/tts.py render --plan plan.json --out ou
 - [华老栓示例](examples/hua-laoshuan/director.md)：保留原稿并展示按位置的可听替换。
 - [语音指令与引用上文示例](examples/context/director.md)：展示正文、演绎要求和前文。
 - [中英混读计划](examples/mixed/plan.json)与[原稿](examples/mixed/source.txt)：悠悠君子 2.0、英语品牌提示、型号中文“点”转写及字幕。
-- [情绪演绎计划](examples/perform/plan.json)与[音色映射模板](examples/voices.example.json)：旁白 TTS、白骨精冷笑 perform 与人工多 take 选择；该预置音色示例尚未真实合成验收。
+- [情绪演绎计划](examples/perform/plan.json)与[音色映射模板](examples/voices.example.json)：旁白 TTS、白骨精冷笑 perform 与人工多 take 选择；使用音色 ID 指定声音，描述中不添加音频引用标记，实际效果按账号权限与试听确认。
 - [SKILL.md](skills/volce-tts-director/SKILL.md)：Agent 的完整工作流程。
 - [运行与计划格式](skills/volce-tts-director/references/usage.md)：字段、纠音投递方式、方言和请求细节。
 

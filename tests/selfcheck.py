@@ -1103,18 +1103,27 @@ def perform_checks():
 
     def body_validation(out):
         assert tts.PERFORM_ENDPOINT == "https://openspeech.bytedance.com/api/v3/tts/create"
-        assert tts.PERFORM_MODEL == "seed-audio-1.0" and tts.PERFORM_REF_TAG == "@音频1"
+        assert tts.PERFORM_MODEL == "seed-audio-1.0"
         item = clip()
         snapshot = copy.deepcopy(item)
         tts.validate(plan(item), complete=True)
         body = tts.perform_body(item)
         dry_line = "只生成这一个角色的人声干声，不要背景音乐、环境声或音效，不要添加台词以外的话。"
         assert body == {"model": "seed-audio-1.0", "text_prompt": "\n".join([
-            "@音频1 是“女妖”的音色，全程只用这个音色。",
-            "女妖（参考 @音频1）先叹气，再轻声说：“你好。”", dry_line]),
+            "“女妖”全程只用指定音色。",
+            "女妖先叹气，再轻声说：“你好。”", dry_line]),
             "references": [{"speaker": clone_voice}], "audio_config": {
                 "format": "wav", "sample_rate": 24000, "speech_rate": 0, "enable_subtitle": True}}
         assert item == snapshot, "构造请求不能修改计划"
+        for voice in (clone_voice, tts.VOICE):
+            speaker_clip = copy.deepcopy(item)
+            speaker_clip["voice"] = voice
+            speaker_clip.pop("resource_id", None)
+            tts.validate(plan(speaker_clip), complete=True)
+            speaker_body = tts.perform_body(speaker_clip)
+            assert "@音频" not in speaker_body["text_prompt"], "使用音色 ID 时描述不能添加音频引用标记"
+            assert speaker_body["references"] == [{"speaker": voice}], "音色只通过 references.speaker 指定"
+            assert voice not in speaker_body["text_prompt"]
         expected_fp = hashlib.sha256(json.dumps({"endpoint": tts.PERFORM_ENDPOINT,
             "model": tts.PERFORM_MODEL, "body": body, "take": 1}, sort_keys=True,
             ensure_ascii=False).encode()).hexdigest()

@@ -25,9 +25,9 @@ description: 把你的稿件变成有情绪、有节奏的配音成品。基于�
 
 ## 情绪演绎模式
 
-- v0.4.0 新增；2026-10-12 一个获授权 S_ 样本已核对 HTTP 200 无 code、双声道下混与字幕；用户试听认为该冷笑样本优于 TTS，不证明 @音频1 语义绑定、音色相似度或干声效果，zh_ 尚未测，见 [情绪演绎模式](references/usage.md#情绪演绎模式)。`prepare` 不变，校对时手动设 `mode: perform`；省略 mode 仍走原 TTS，旧请求、指纹与缓存不变。
+- v0.4.0 新增；2026-10-12 一个获授权 S_ 样本已核对 HTTP 200 无 code、双声道下混与字幕；用户试听认为该冷笑样本优于 TTS，音色相似度与干声质量仍按具体样本试听确认，见 [情绪演绎模式](references/usage.md#情绪演绎模式)。`prepare` 不变，校对时手动设 `mode: perform`；省略 mode 仍走原 TTS，旧请求、指纹与缓存不变。
 - 用于笑、哭出声、尖叫、叹气、冷笑、打滚喊疼等副语言，或 `S_` 复刻音色的强情绪；预置 2.0 音色先试 `direction`，不够再用 perform。
-- 一角色一音色，两种模式共用 `voices`；优先级是片段显式 `voice` > CLI `--voices` 映射 > 计划映射。首次使用按授权各生成一句同角色 TTS / perform 短样，A/B 试听一致性，不因 ID 相同就保证听感相同。
+- 一角色一音色，两种模式共用 `voices`；优先级是片段显式 `voice` > CLI `--voices` 映射 > 计划映射。perform 的预置 2.0 `zh_` 与复刻 `S_` 音色只通过 `references[].speaker` 指定，描述里不要写 `@音频N`。首次使用按授权各生成一句同角色 TTS / perform 短样，A/B 试听一致性，不因 ID 相同就保证听感相同。
 - `perform.prompt` 只写能听见的动作与顺序（先冷笑、停半拍、再低声说），不写台词、不堆抽象词；台词只放 `text`，perform 每段最多 400 字。
 - `takes` 默认 1，允许 1～4；每个 take 独立计费，按 `original_duration` 约 1 元/分钟，以控制台为准。先 dry-run 说明调用上界（不估缓存命中）、粗估时长与预算，再按授权生成。
 - 多 take 不自动挑选：`selected_take: null` 暂用 take 1，标 provisional；让用户试听 `takes/` 后写入 1 起的 `selected_take`，同目录再 render 只重拼、不重发已完成请求。结构检查与 `text_match` 不证明演得好。

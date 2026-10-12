@@ -31,8 +31,6 @@ from pypinyin.constants import PINYIN_DICT
 ENDPOINT = "https://openspeech.bytedance.com/api/v3/tts/unidirectional"
 PERFORM_ENDPOINT = "https://openspeech.bytedance.com/api/v3/tts/create"
 PERFORM_MODEL = "seed-audio-1.0"
-# S_ 请求携带此标记已实测返回音频；音色绑定与听感仍须试听，不自动探测或重试。
-PERFORM_REF_TAG = "@音频1"
 VOICE = "zh_female_vv_uranus_bigtts"
 PRONUNCIATIONS = Path(__file__).resolve().parents[1] / "references/pronunciations.json"
 DIGITS = ("zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine")
@@ -665,12 +663,14 @@ def perform_body(clip, enable_subtitle=None, pronunciation_table=None, complete=
     role = clip.get("role", "旁白")
     if not isinstance(role, str) or not role.strip():
         raise ValueError("role 必须为非空字符串")
-    lines = [f'{PERFORM_REF_TAG} 是“{role}”的音色，全程只用这个音色。']
+    text = "".join(text)
+    # 音色只由 references[].speaker 指定，不在描述中添加音频引用标记。
+    lines = [f'“{role}”全程只用指定音色。']
     if clip.get("direction"):
         lines.append(f'{role}的整体语气：{clip["direction"]}')
     if clip.get("reference_text"):
         lines.append("上文（只用于理解情绪，不要念出来）：" + clip["reference_text"])
-    lines.append(f'{role}（参考 {PERFORM_REF_TAG}）{prompt}：“{"".join(text)}”')
+    lines.append(f'{role}{prompt}：“{text}”')
     if instructions or hints:
         lines.append("发音要求：" + "\n".join(instructions + hints))
     if not config.get("ambience", False):
