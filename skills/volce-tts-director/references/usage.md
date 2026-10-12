@@ -40,7 +40,15 @@ uv run scripts/tts.py render --plan plan.json --out 音频
 
 上面仅演示字段；实际候选以扫描结果为准。标注可覆盖单字或词组，不能重叠。每个词组最多 9 个汉字，每个字一个拼音。替换词组标注时删除已覆盖的单字标注。请求采用官方 `additions` JSON 字符串里的 `pronunciation_dict.tone`，例如 `银行/(yin2)(hang2)`；同词规则去重，并模拟贪心最长匹配，验证每个已校对位置实际得到指定读音。显示注音不改变 `req_params.text`；已授权的客户端可听别名除外。
 
-普通 TTS 只允许官方固定端点 `https://openspeech.bytedance.com/api/v3/tts/unidirectional`，资源限定 `seed-tts-2.0`（`zh_` 预置音色）和 `seed-icl-2.0`（`S_` 已有克隆音色），不隐式代理到其他供应商。可用音色以用户控制台权限为准；离线检查只验证 ID 格式和本工具的资源组合，不能证明账号权限、训练状态或中文发音效果。
+普通 TTS 只允许官方固定端点 `https://openspeech.bytedance.com/api/v3/tts/unidirectional`，资源限定 `seed-tts-2.0`（`zh_` / `ICL_uranus_*_tob` 预置 2.0 音色）和 `seed-icl-2.0`（`S_` 已有克隆音色），不隐式代理到其他供应商。可用音色以用户控制台权限为准；离线检查只验证 ID 格式和本工具的资源组合，不能证明账号权限、训练状态或中文发音效果。
+
+支持的 ID 格式与提前校验：
+
+- `zh_` 后接英文、数字或下划线；典型 2.0 格式为 `zh_*_uranus_bigtts`，普通 TTS 使用 `seed-tts-2.0`。
+- `ICL_uranus_*_tob`：中间名称非空，由英文、数字或下划线组成，大小写与前后缀须匹配；同样使用 `seed-tts-2.0`，不能误配 `seed-icl-2.0`，也不接受任意其他 `ICL_` ID。
+- `S_` 后接非空英文字母或数字：已有声音复刻 2.0 音色，使用 `seed-icl-2.0`；前缀不证明训练代际。
+- **先拒绝任意包含 `_mars_` 或 `_moon_` 的 ID**，它们属于不支持的 1.0 音色。prepare、preview、render（含 dry-run）和 voices 映射均共用此检查，在读取合成密钥或联网前提示换成官方列表中对应的 2.0 音色。不能只修改 resource_id，也不自动把字符串替换成另一个音色。
+- 三类受支持 ID 均可用于 perform，直接写入 `references[].speaker`；perform 不发送 TTS 资源头，但仍校验显式 resource_id 与音色类型一致。
 
 `speech_rate` 为整数 -50～100（0 为正常）；`pause_after_ms` 为本地拼接停顿，0～30000 毫秒；`direction` 写中文导演说明。普通 TTS 请求输出 24kHz 单声道 PCM，使用 Python 标准库包装成 WAV、顺序拼接，无需 ffmpeg。正式调用保存无凭据的请求、请求 ID、服务端 logid、用量与耗时。默认启用逐字字幕，输出片段 `*.words.json`、全片 `timeline.json` 和句级 `final.srt`；未返回字幕时明确标记，不虚构时间戳，详见 [逐字时间戳与字幕](#逐字时间戳与字幕)。
 
@@ -75,8 +83,8 @@ uv run --with pypinyin==0.55.0 python tests/selfcheck.py
 | `perform.takes` | 1～4 的整数，默认 **1**；每个 take 都是独立计费调用，不自动重试 |
 | `perform.selected_take` | `null`（默认）或 1～takes 的整数；takes > 1 且 null 时暂用 take 1，须人工试听后选择；takes = 1 视为 single |
 | `perform.ambience` | 布尔值，默认 **false**，自动加入只要人声干声的约束；true 仅移除此约束，允许模型混合环境声，不提供分轨 |
-| `voice` | 可显式填写，或按 role 从映射解析；接受有权限的 2.0 `zh_` 预置 / 已有 `S_` 复刻 ID，放入 `references[0].speaker`，不能把体验中心昵称当 ID |
-| `resource_id` | 可省略；填写时仍按原规则校验与音色一致（zh_ / seed-tts-2.0，S_ / seed-icl-2.0），但不发送到 perform 请求或请求头 |
+| `voice` | 可显式填写，或按 role 从映射解析；接受有权限的 2.0 `zh_` / `ICL_uranus_*_tob` 预置及已有 `S_` 复刻 ID，放入 `references[0].speaker`，不能把体验中心昵称当 ID |
+| `resource_id` | 可省略；填写时仍按原规则校验与音色一致（zh_ 或 ICL_uranus_*_tob / seed-tts-2.0，S_ / seed-icl-2.0），但不发送到 perform 请求或请求头 |
 | `text` | 只存台词，最多 **400 字符**，超长明确拆段；这是本地保守策略，官方人声文本建议值不是模型语言上限 |
 | `direction` | 可选字符串，作为角色整体语气放在 perform.prompt 前 |
 | `reference_text` | 可选真实上文，本地上限 500 字符；加“只用于理解情绪，不要念出来”说明，仍有被模型串读风险，必须试听 |
@@ -128,7 +136,7 @@ Agent 只编辑字段，由脚本拼出以下模板；不要自行把注音阅�
 只生成这一个角色的人声干声，不要背景音乐、环境声或音效，不要添加台词以外的话。
 ```
 
-最后一行只在 ambience=false 时加入。**使用音色 ID 时，描述里不要写 `@音频N`；声音只通过 `references[].speaker` 指定。** 这条规则同时适用于豆包 TTS 2.0 预置 `zh_` 音色与复刻 `S_` 音色，不能把音频参考标记混入 speaker 模式。示例动作可以是“先压低嗓子发出三声尖细冷笑，停半拍，再拖长尾音、低声说”；台词仍只在 text。实际提交文本只应用已授权的 spoken_alias，原稿保留。方向、上文或发音提示也可能被模型忽略或念出，preview / requests.json 只证明接线，不能替代试听。
+最后一行只在 ambience=false 时加入。**使用音色 ID 时，描述里不要写 `@音频N`；声音只通过 `references[].speaker` 指定。** 这条规则同时适用于豆包 TTS 2.0 预置 `zh_` / `ICL_uranus_*_tob` 音色与复刻 `S_` 音色，不能把音频参考标记混入 speaker 模式。示例动作可以是“先压低嗓子发出三声尖细冷笑，停半拍，再拖长尾音、低声说”；台词仍只在 text。实际提交文本只应用已授权的 spoken_alias，原稿保留。方向、上文或发音提示也可能被模型忽略或念出，preview / requests.json 只证明接线，不能替代试听。
 
 请求体示意（非真实成功响应证据）：
 
@@ -280,7 +288,7 @@ uv run scripts/tts.py prepare --text-file 原稿.txt --voice S_替换成你的�
 # 完成 readings 语境校对后，按常规 preview → dry-run → 已授权 render 流程执行
 ```
 
-`--resource-id` 可省略：`zh_` 默认 `seed-tts-2.0`，`S_` 默认 `seed-icl-2.0`。每段可在计划中显式填写 `resource_id`，音色/资源错配或未知资源在联网前拒绝。克隆草稿写入所选资源并将 `direction` 留空，不自动假设支持普通话风格或语音指令；用户明确设置的控制字段不会静默删除。指令、上文、字典、方言的效果仍依具体训练版本和音色能力验证。
+`--resource-id` 可省略：`zh_` 与 `ICL_uranus_*_tob` 预置 2.0 音色默认 `seed-tts-2.0`，`S_` 默认 `seed-icl-2.0`。每段可在计划中显式填写 `resource_id`，音色/资源错配或未知资源在联网前拒绝。克隆草稿写入所选资源并将 `direction` 留空，不自动假设支持普通话风格或语音指令；用户明确设置的控制字段不会静默删除。指令、上文、字典、方言的效果仍依具体训练版本和音色能力验证。
 
 阅读稿展示资源；dry-run 的 JSON 结果和 `routes.json` 包含逐片段 `clip`、`speaker`、`resource_id` 与固定 `endpoint`，不包含密钥；`requests.json` 保持请求体数组格式。dry-run 不联网、不读取密钥，但会写本地检查文件，不能证明音色已训练或账号有权限。正式请求使用 `X-Api-Resource-Id` 选择资源，不使用旧版 `cluster`。
 

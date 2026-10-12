@@ -1115,7 +1115,7 @@ def perform_checks():
             "references": [{"speaker": clone_voice}], "audio_config": {
                 "format": "wav", "sample_rate": 24000, "speech_rate": 0, "enable_subtitle": True}}
         assert item == snapshot, "构造请求不能修改计划"
-        for voice in (clone_voice, tts.VOICE):
+        for voice in (clone_voice, tts.VOICE, "ICL_uranus_offlineVoice01_tob"):
             speaker_clip = copy.deepcopy(item)
             speaker_clip["voice"] = voice
             speaker_clip.pop("resource_id", None)
@@ -1227,6 +1227,87 @@ def perform_checks():
         assert tts.perform_body(preset)["references"] == [{"speaker": tts.VOICE}]
         for flag in ("true", 1):
             fails(lambda: tts.perform_body(item, flag), "字幕覆盖开关须为布尔值")
+
+    def voice_families(out):
+        icl_voice = "ICL_uranus_offlineVoice01_tob"
+        for voice, resource in ((tts.VOICE, "seed-tts-2.0"), (icl_voice, "seed-tts-2.0"),
+                                ("ICL_uranus_male_offline_02_tob", "seed-tts-2.0"),
+                                (clone_voice, "seed-icl-2.0")):
+            assert tts.resolve_resource({"voice": voice}) == resource
+            assert tts.resolve_resource({"voice": voice, "resource_id": resource}) == resource
+            wrong = "seed-icl-2.0" if resource == "seed-tts-2.0" else "seed-tts-2.0"
+            fails(lambda: tts.resolve_resource({"voice": voice, "resource_id": wrong}), "音色资源错配须拒绝")
+        draft = tts.prepare("你好。", icl_voice)
+        assert draft["clips"][0]["direction"] == tts.prepare("你好。", tts.VOICE)["clips"][0]["direction"]
+        assert tts.prepare("你好。", icl_voice, "seed-tts-2.0")["clips"][0]["resource_id"] == "seed-tts-2.0"
+        for voice in ("ICL_uranus__tob", "ICL_uranus_offline", "ICL_offline_tob",
+                      "ICL_uranus_offline_tob/", "ICL_uranus_offline_tob_extra", "icl_uranus_offline_tob"):
+            fails(lambda: tts.resolve_resource({"voice": voice}), "拒绝不完整或非法 ICL_uranus 音色 ID")
+        script = plan(clip("icl-tts", mode="tts", voice=icl_voice), clip("icl-perform", voice=icl_voice))
+        for item in script["clips"]:
+            item.pop("voice")
+        script["voices"] = {"女妖": icl_voice}
+        with patch.object(tts.os, "environ", NoKeyEnvironment()):
+            tts.preview(script, out / "preview")
+            assert icl_voice in (out / "preview/director.md").read_text()
+            summary = tts.render(script, out / "dry", dry_run=True)
+            assert summary["routes"][0]["resource_id"] == "seed-tts-2.0"
+            assert summary["routes"][1]["model"] == tts.PERFORM_MODEL
+            assert "resource_id" not in summary["routes"][1]
+            bodies = load(out / "dry/requests.json")
+            assert bodies[0]["req_params"]["speaker"] == icl_voice
+            assert bodies[1]["references"] == [{"speaker": icl_voice}]
+            assert "@音频" not in bodies[1]["text_prompt"]
+        network = Network(out / "audio")
+        with patch.object(tts.urllib.request, "build_opener", side_effect=network.build):
+            assert tts.render(script, out / "audio")["timestamps"] is True
+            assert [call["mode"] for call in network.calls] == ["tts", "perform"]
+            assert network.calls[0]["body"]["req_params"]["speaker"] == icl_voice
+            assert network.calls[1]["body"]["references"] == [{"speaker": icl_voice}]
+            tts.render(script, out / "audio")
+            assert len(network.calls) == 2, "ICL_uranus 两种模式都复用完成缓存"
+        for mode in ("tts", "perform"):
+            mismatch = plan(clip(mode=mode, voice=icl_voice))
+            mismatch["clips"][0]["resource_id"] = "seed-icl-2.0"
+            fails(lambda: tts.validate(mismatch), "ICL_uranus 不能误用克隆资源，即使在 perform 模式")
+
+        def legacy_error(call):
+            try:
+                call()
+            except ValueError as exc:
+                assert all(part in str(exc) for part in ("1.0", "对应的 2.0 音色", "不能只修改 resource_id"))
+            else:
+                raise AssertionError("1.0 音色必须在本地拒绝")
+
+        old_voices = ("zh_female_offline_mars_bigtts", "zh_male_offline_moon_bigtts",
+                      "ICL_mars_offline_tob", "ICL_moon_offline_tob",
+                      "ICL_uranus_offline_mars_voice_tob", "zh_offline_moon_uranus_bigtts")
+        with patch.object(tts.os, "environ", NoKeyEnvironment()):
+            for voice in old_voices:
+                legacy_error(lambda: tts.resolve_resource({"voice": voice, "resource_id": "seed-tts-2.0"}))
+                legacy_error(lambda: tts.prepare("你好。", voice))
+                for mode in ("tts", "perform"):
+                    bad = plan(clip("legacy", mode=mode))
+                    bad["clips"][0].update(voice=voice)
+                    legacy_error(lambda: tts.preview(bad, out / "blocked"))
+                    legacy_error(lambda: tts.render(bad, out / "blocked", dry_run=True))
+                    legacy_error(lambda: tts.render(plan(clip("first"), bad["clips"][0]), out / "blocked"))
+                    mapped = copy.deepcopy(bad)
+                    mapped["clips"][0].pop("voice")
+                    mapped["voices"] = {"女妖": voice}
+                    legacy_error(lambda: tts.preview(mapped, out / "blocked"))
+                    mapped["voices"] = {"女妖": icl_voice}
+                    legacy_error(lambda: tts.render(mapped, out / "blocked", dry_run=True, voices={"女妖": voice}))
+                tts.save(out / "legacy-plan.json", bad)
+                for command in ("preview", "render"):
+                    args = ["tts.py", command, "--plan", str(out / "legacy-plan.json"), "--out", str(out / "blocked")]
+                    if command == "render":
+                        args.append("--dry-run")
+                    error = io.StringIO()
+                    with patch("sys.argv", args), redirect_stderr(error):
+                        assert tts.main() == 1
+                    assert "对应的 2.0 音色" in error.getvalue()
+            assert not (out / "blocked").exists(), "旧音色必须在创建输出目录或读取密钥前拒绝"
 
     def voices_dry_preview(out):
         narrated = clip("narrator", mode="tts", voice=tts.VOICE)
@@ -1689,7 +1770,8 @@ def perform_checks():
             tts.render(plan(item), directory)
             assert len(network.calls) == 1, "关闭字幕的 perform 缓存也复用公共缓存适配器"
 
-    checks = [("body/validation", body_validation), ("voices/dry-run/preview/CLI", voices_dry_preview),
+    checks = [("body/validation", body_validation), ("voice families/legacy rejection", voice_families),
+              ("voices/dry-run/preview/CLI", voices_dry_preview),
               ("legacy TTS", legacy_tts), ("multi-take selection/cache", multitake_selection),
               ("only-mode/full joins/subtitle offsets", only_mode_and_offsets),
               ("cache preflight", cache_preflight), ("WAV downmix/debug", downmix_debug),

@@ -358,13 +358,17 @@ def resolve_resource(clip):
     voice = clip["voice"]
     if isinstance(voice, str) and ("替换" in voice or "你的" in voice):
         raise ValueError("音色 ID 是占位值，请填写自己的音色")
-    if isinstance(voice, str) and re.fullmatch(r"zh_[a-zA-Z0-9_]+", voice):
+    if isinstance(voice, str) and any(marker in voice for marker in ("_mars_", "_moon_")):
+        raise ValueError(f"音色 {voice} 是 1.0 音色，本工具只支持 2.0；"
+                         "请换成官方音色列表中对应的 2.0 音色（zh_*_uranus_bigtts 或 ICL_uranus_*_tob），"
+                         "不能只修改 resource_id")
+    if isinstance(voice, str) and re.fullmatch(r"(?:zh_[a-zA-Z0-9_]+|ICL_uranus_[a-zA-Z0-9_]+_tob)", voice):
         expected = "seed-tts-2.0"
     elif isinstance(voice, str) and re.fullmatch(r"S_[a-zA-Z0-9]+", voice):
         # S_ 不代表训练代际；本工具只接复刻 2.0，不自动探测其他资源。
         expected = "seed-icl-2.0"
     else:
-        raise ValueError("需要中文预置音色 ID（zh_）或已有克隆音色 ID（S_）")
+        raise ValueError("需要 2.0 预置音色 ID（zh_ 或 ICL_uranus_*_tob）或已有克隆音色 ID（S_）")
     resource = clip.get("resource_id", expected)
     if not isinstance(resource, str) or resource != expected:
         raise ValueError(f"音色 {voice} 在本工具中需要 resource_id={expected}")
