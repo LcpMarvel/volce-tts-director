@@ -5,8 +5,11 @@ import hashlib
 import importlib.util
 import io
 import json
+import math
 import os
+import struct
 import tempfile
+import traceback
 import uuid
 import wave
 from contextlib import redirect_stderr, redirect_stdout
@@ -31,11 +34,11 @@ def clone_checks(plan, frames, pcm):
     clone = copy.deepcopy(plan)
     clone["clips"] = clone["clips"][:1]
     clip = clone["clips"][0]
-    clip.update(voice="S_xWSg2NNT1", direction="")
+    clip.update(voice="S_offlineClone01", direction="")
     tts.validate(clone, True)
     assert tts.resolve_resource(clip) == "seed-icl-2.0"
     body = tts.request_body(clip)
-    assert body["req_params"]["speaker"] == "S_xWSg2NNT1"
+    assert body["req_params"]["speaker"] == "S_offlineClone01"
     assert isinstance(body["req_params"]["additions"], str)
     assert "context_texts" not in json.loads(body["req_params"]["additions"])
     draft = tts.prepare("你好。", voice=clip["voice"])
@@ -43,7 +46,7 @@ def clone_checks(plan, frames, pcm):
     assert draft["clips"][0]["direction"] == ""
     assert tts.prepare("你好。", clip["voice"], "seed-icl-2.0") == draft
     assert tts.prepare("你好。")["clips"][0]["direction"] == "自然、清楚的普通话朗读"
-    for voice in ("S_", "S_xWSg2NNT1/", "S_x WSg2NNT1", "en_voice", "", None, 123):
+    for voice in ("S_", "S_offlineClone01/", "S_offline Clone01", "en_voice", "", None, 123):
         bad = copy.deepcopy(clone)
         bad["clips"][0]["voice"] = voice
         fails(lambda: tts.validate(bad), "拒绝非法音色")
@@ -973,6 +976,731 @@ def mixed_checks():
         assert all("offline-fake-key" not in f.read_text() for f in (out / "audio").glob("*.json"))
 
 
+def perform_checks():
+    """情绪演绎离线回归；合成 JSON/WAV 夹具不代表线上协议已实测。"""
+    secret = "offline-perform-api-secret"
+    clone_voice = "S_offlinePerform01"
+    dry_guard = "preview/dry-run 不得读取密钥或访问网络"
+
+    def clip(ident="perform", text="你好。", mode="perform", voice=clone_voice):
+        prepared = tts.prepare(text, voice)
+        item = prepared["clips"][0]
+        assert len(prepared["clips"]) == 1
+        item.update(id=ident, role="女妖", direction="", pause_after_ms=0)
+        for row in item["readings"]:
+            row.update(status="reviewed", delivery="native")
+        if mode is not None:
+            item["mode"] = mode
+        if mode == "perform":
+            item["perform"] = {"prompt": "先叹气，再轻声说"}
+        return item
+
+    def plan(*items):
+        return {"title": "离线情绪演绎", "clips": list(items) or [clip()]}
+
+    def load(path):
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+
+    def fp(item, take=1, enable_subtitle=None, table=None):
+        return tts.perform_fingerprint(tts.perform_body(item, enable_subtitle, table), take)
+
+    def wav(pcm, channels=1, rate=24000, width=2):
+        output = io.BytesIO()
+        with wave.open(output, "wb") as stream:
+            stream.setnchannels(channels)
+            stream.setsampwidth(width)
+            stream.setframerate(rate)
+            stream.writeframes(pcm)
+        return output.getvalue()
+
+    def pcm(value=1000, frames=24000):
+        return struct.pack("<h", value) * frames
+
+    def read_pcm(path):
+        with wave.open(str(path), "rb") as stream:
+            assert (stream.getnchannels(), stream.getsampwidth(), stream.getframerate()) == (1, 2, 24000)
+            return stream.getnframes(), stream.readframes(stream.getnframes())
+
+    def subtitle(text="你好。", start=100, end=800):
+        return {"text": text, "sentences": [{"text": text, "start_time": start, "end_time": end,
+                "words": [{"text": text, "start_time": start, "end_time": end}]}]}
+
+    def payload(audio=None, code=0, text="你好。"):
+        return {"code": code, "message": "OK", "audio": base64.b64encode(
+                wav(pcm()) if audio is None else audio).decode(), "duration": 1.0,
+                "original_duration": 1.75, "url": "https://example.invalid/private-audio?token=not-stored",
+                "subtitle": subtitle(text)}
+
+    class Response(io.BytesIO):
+        headers = {"X-Tt-Logid": "offline-perform-logid"}
+        status = 200
+        code = 200
+
+        def getcode(self):
+            return self.code
+
+    class Network:
+        """所有合成连接由 build_opener 替换，绝不委托 urllib 原始实现。"""
+        def __init__(self, out, respond=None):
+            self.out = out
+            self.respond = respond
+            self.calls = []
+
+        def build(self, *handlers):
+            assert any(handler is tts.NoRedirect or isinstance(handler, tts.NoRedirect)
+                       for handler in handlers), "两种模式都必须禁止重定向"
+            return self
+
+        def open(self, request, timeout):
+            assert request.method == "POST" and request.get_header("X-api-key") == secret
+            assert request.get_header("Content-type") == "application/json"
+            request_id = request.get_header("X-api-request-id")
+            assert str(uuid.UUID(request_id)) == request_id
+            body = json.loads(request.data)
+            manifest = load(self.out / "manifest.json")
+            active = [entry for entry in manifest.values() if entry.get("request_id") == request_id]
+            assert len(active) == 1 and active[0]["status"] == "uncertain", "任何连接前必须持久写入 uncertain"
+            entry = active[0]
+            if request.full_url == tts.PERFORM_ENDPOINT:
+                assert timeout == 300
+                assert request.get_header("X-api-resource-id") is None
+                assert {name.lower() for name, _ in request.header_items()} == {
+                    "content-type", "x-api-key", "x-api-request-id"}
+                assert body["model"] == tts.PERFORM_MODEL
+                assert body["audio_config"]["format"] == "wav"
+                assert body["audio_config"]["sample_rate"] == 24000
+                assert entry["mode"] == "perform" and entry["model"] == tts.PERFORM_MODEL
+                take = entry["take"]
+                fingerprint = tts.perform_fingerprint(body, take)
+                assert manifest[fingerprint] is entry
+                call = {"mode": "perform", "take": take, "body": body, "entry": entry}
+                default = payload(wav(pcm(1000 * take)), code=0 if take % 2 else 20000000)
+            else:
+                assert request.full_url == tts.ENDPOINT and timeout == 90
+                resource = request.get_header("X-api-resource-id")
+                assert resource == ("seed-icl-2.0" if body["req_params"]["speaker"].startswith("S_")
+                                    else "seed-tts-2.0")
+                call = {"mode": "tts", "body": body, "entry": entry}
+                text = body["req_params"]["text"]
+                default = b"\n".join(json.dumps(frame, ensure_ascii=False).encode() for frame in [
+                    {"code": 0, "data": base64.b64encode(pcm(3000)).decode(), "sentence": {
+                        "text": text, "words": [{"word": text, "startTime": .1, "endTime": .8}]}},
+                    {"code": 20000000, "usage": {"text_words": len(text)}}])
+            self.calls.append(call)
+            value = self.respond(call) if self.respond is not None else default
+            if isinstance(value, Exception):
+                raise value
+            return Response(value if isinstance(value, bytes) else json.dumps(value, ensure_ascii=False).encode())
+
+    class NoKeyEnvironment(dict):
+        def get(self, name, default=None):
+            assert name != "VOLC_TTS_API_KEY", dry_guard
+            return super().get(name, default)
+
+        def __getitem__(self, name):
+            assert name != "VOLC_TTS_API_KEY", dry_guard
+            return super().__getitem__(name)
+
+    def body_validation(out):
+        assert tts.PERFORM_ENDPOINT == "https://openspeech.bytedance.com/api/v3/tts/create"
+        assert tts.PERFORM_MODEL == "seed-audio-1.0" and tts.PERFORM_REF_TAG == "@音频1"
+        item = clip()
+        snapshot = copy.deepcopy(item)
+        tts.validate(plan(item), complete=True)
+        body = tts.perform_body(item)
+        dry_line = "只生成这一个角色的人声干声，不要背景音乐、环境声或音效，不要添加台词以外的话。"
+        assert body == {"model": "seed-audio-1.0", "text_prompt": "\n".join([
+            "@音频1 是“女妖”的音色，全程只用这个音色。",
+            "女妖（参考 @音频1）先叹气，再轻声说：“你好。”", dry_line]),
+            "references": [{"speaker": clone_voice}], "audio_config": {
+                "format": "wav", "sample_rate": 24000, "speech_rate": 0, "enable_subtitle": True}}
+        assert item == snapshot, "构造请求不能修改计划"
+        expected_fp = hashlib.sha256(json.dumps({"endpoint": tts.PERFORM_ENDPOINT,
+            "model": tts.PERFORM_MODEL, "body": body, "take": 1}, sort_keys=True,
+            ensure_ascii=False).encode()).hexdigest()
+        assert tts.perform_fingerprint(body, 1) == expected_fp
+        assert tts.perform_fingerprint(body, 2) != expected_fp
+        editorial = copy.deepcopy(item)
+        editorial["perform"].update(takes=4, selected_take=3)
+        editorial.update(id="other", pause_after_ms=30000)
+        assert tts.perform_body(editorial) == body and fp(editorial) == expected_fp
+        for name, value in (("text", "再见。"), ("voice", tts.VOICE), ("speech_rate", 10),
+                            ("direction", "压低声音"), ("reference_text", "屋外很冷。")):
+            changed = copy.deepcopy(item)
+            changed[name] = value
+            if name == "text":
+                changed["readings"] = clip(text=value)["readings"]
+            if name == "voice":
+                changed.pop("resource_id", None)
+            assert fp(changed) != expected_fp, f"{name} 必须参与指纹"
+        changed = copy.deepcopy(item)
+        changed["perform"]["prompt"] = "先冷笑，再说"
+        assert fp(changed) != expected_fp
+        expressive = clip(text="华行。")
+        expressive.update(direction="冷静而克制", reference_text="刚听到坏消息。", speech_rate=-10,
+                          explicit_language="zh-cn")
+        for row in expressive["readings"]:
+            if row["text"] == "华":
+                row.update(pinyin=["hua4"], delivery="spoken_alias", spoken_alias="桦", alias_approved=True)
+            elif row["text"] == "行":
+                row.update(pinyin=["xing2"], delivery="instruction")
+        tts.validate(plan(expressive), complete=True)
+        prompt = tts.perform_body(expressive)["text_prompt"]
+        assert "：“桦行。”" in prompt and expressive["text"] == "华行。"
+        assert "女妖的整体语气：冷静而克制" in prompt
+        assert "上文（只用于理解情绪，不要念出来）：刚听到坏消息。" in prompt
+        assert prompt.index("冷静而克制") < prompt.index(expressive["perform"]["prompt"])
+        assert all(value in prompt for value in ("发音要求", "hua4", "xing2"))
+        assert tts.perform_body(expressive)["audio_config"]["speech_rate"] == -10
+        assert "explicit_language" not in tts.perform_body(expressive)
+        expressive["perform"]["ambience"] = True
+        assert dry_line not in tts.perform_body(expressive)["text_prompt"]
+        for flag in (True, False):
+            expressive["enable_subtitle"] = not flag
+            assert tts.perform_body(expressive, flag)["audio_config"]["enable_subtitle"] is flag
+            assert tts.perform_body(expressive)["audio_config"]["enable_subtitle"] is (not flag)
+        table = {"version": 1, "words": {"Brand": "brand"}, "acronyms": {"API": "A P I"},
+                 "models": ["V4.1"], "decimal_point": "点"}
+        english = clip(text="Brand speaks.")
+        hinted = tts.perform_body(english, pronunciation_table=table)
+        assert "brand" in hinted["text_prompt"] and "发音要求" in hinted["text_prompt"]
+        assert "pronunciation_dict" not in hinted
+        for text in ("API", "V4.1"):
+            fails(lambda: tts.perform_body(clip(text=text), pronunciation_table=table),
+                  "perform 不支持发音表缩写/型号转写")
+            bad = plan(clip(text=text))
+            bad["pronunciation_table"] = table
+            fails(lambda: tts.validate(bad, complete=True), "validate 也必须拒绝发音表字典命中")
+        failures = [("mode", value) for value in ("other", None, True, [])]
+        failures += [("text", "甲" * 401), ("direction", "低" * 3001),
+                     ("pronunciation_dict", {"tone": ["你/(ni3)"]}),
+                     ("explicit_dialect", "beijing"), ("explicit_dialect", ""),
+                     ("enable_latex_tn", True), ("enable_latex_tn", False),
+                     ("section_id", "part-one"), ("section_id", ""),
+                     ("explicit_language", "ja"), ("explicit_language", None), ("enable_subtitle", 1),
+                     ("speech_rate", -51), ("resource_id", "seed-tts-2.0")]
+        for name, value in failures:
+            bad = plan()
+            bad["clips"][0][name] = value
+            fails(lambda: tts.validate(bad, complete=True), "拒绝 perform 无效字段：" + name)
+        for value in (None, [], {}, {"prompt": ""}, {"prompt": "   "}, {"prompt": 123},
+                      {"prompt": "低" * 501}):
+            bad = plan()
+            bad["clips"][0]["perform"] = value
+            fails(lambda: tts.validate(bad, complete=True), "拒绝缺失/无效 perform.prompt")
+        for name, values in (("takes", (0, 5, True, 1.5, "2", None)),
+                             ("selected_take", (0, 3, True, 1.5, "1")),
+                             ("ambience", (1, "false", None))):
+            for value in values:
+                bad = plan()
+                bad["clips"][0]["perform"].update(takes=2)
+                bad["clips"][0]["perform"][name] = value
+                fails(lambda: tts.validate(bad, complete=True), "拒绝 perform 无效选项：" + name)
+        for mode in (None, "tts"):
+            bad = plan(clip(mode=mode))
+            bad["clips"][0]["perform"] = {"prompt": "只说一句"}
+            fails(lambda: tts.validate(bad), "TTS 片段不能携带 perform")
+        bad = plan()
+        del bad["clips"][0]["perform"]
+        fails(lambda: tts.validate(bad), "perform 模式必须有导演说明")
+        pending = plan()
+        pending["clips"][0]["readings"][0]["status"] = "pending"
+        fails(lambda: tts.validate(pending, complete=True), "perform 也必须校对所有多音字")
+        dictionary = plan()
+        dictionary["clips"][0]["readings"][0]["delivery"] = "dictionary"
+        fails(lambda: tts.validate(dictionary, complete=True), "perform 禁止 dictionary 投递")
+        limit = clip(text="甲" * 400)
+        limit["perform"].update(prompt="低" * 500, takes=4, selected_take=4)
+        tts.validate(plan(limit), complete=True)
+        assert len(tts.perform_body(limit)["text_prompt"]) < 3000
+        preset = clip(voice=tts.VOICE)
+        tts.validate(plan(preset), complete=True)
+        assert tts.perform_body(preset)["references"] == [{"speaker": tts.VOICE}]
+        for flag in ("true", 1):
+            fails(lambda: tts.perform_body(item, flag), "字幕覆盖开关须为布尔值")
+
+    def voices_dry_preview(out):
+        narrated = clip("narrator", mode="tts", voice=tts.VOICE)
+        narrated.update(role="旁白", pause_after_ms=250)
+        performed = clip("actor")
+        performed["perform"].update(takes=2, selected_take=None)
+        performed.update(reference_text="刚才是平静的旁白。")
+        for item in (narrated, performed):
+            item.pop("voice")
+            item.pop("resource_id", None)
+        mapped = plan(narrated, performed)
+        mapped["voices"] = {"旁白": tts.VOICE, "女妖": "S_planVoice01"}
+        override = {"女妖": clone_voice}
+        before, before_override = copy.deepcopy(mapped), copy.deepcopy(override)
+        resolved = tts.resolve_voices(mapped, override)
+        assert resolved is not mapped and all(a is not b for a, b in zip(resolved["clips"], mapped["clips"]))
+        assert [item["voice"] for item in resolved["clips"]] == [tts.VOICE, clone_voice]
+        tts.validate(resolved, complete=True)
+        assert tts.resolve_voices(mapped)["clips"][1]["voice"] == "S_planVoice01"
+        placeholder = copy.deepcopy(mapped)
+        placeholder["voices"]["女妖"] = "S_替换成你的复刻音色ID"
+        assert tts.resolve_voices(placeholder, override)["clips"][1]["voice"] == clone_voice
+        assert fp(resolved["clips"][1]) != fp(tts.resolve_voices(mapped)["clips"][1])
+        explicit = copy.deepcopy(mapped)
+        explicit["clips"][1]["voice"] = "S_explicitVoice01"
+        assert tts.resolve_voices(explicit, override)["clips"][1]["voice"] == "S_explicitVoice01"
+        missing = copy.deepcopy(mapped)
+        missing.pop("voices")
+        try:
+            tts.resolve_voices(missing)
+        except ValueError as exc:
+            assert "旁白" in str(exc) and "女妖" in str(exc), "应列出所有缺音色的角色"
+        else:
+            raise AssertionError("找不到角色音色必须报错")
+        for value in ("S_替换成你的复刻音色ID", "S_", 123, None):
+            invalid = copy.deepcopy(mapped)
+            invalid["voices"]["女妖"] = value
+            fails(lambda: tts.resolve_voices(invalid), "占位或非法映射音色不可用于合成")
+        for value in ([], "voices.json", {"女妖": []}):
+            fails(lambda: tts.resolve_voices(mapped, value), "公共 voices 参数必须为音色映射对象")
+        with patch.object(tts.os, "environ", NoKeyEnvironment()), patch.object(
+                tts.urllib.request, "build_opener", side_effect=AssertionError(dry_guard)):
+            tts.preview(mapped, out / "preview", voices=override)
+            for name in ("director.html", "director.md"):
+                shown = (out / "preview" / name).read_text()
+                assert all(value in shown for value in (clone_voice, "seed-audio-1.0", "先叹气，再轻声说",
+                                                         performed["reference_text"]))
+                assert "试听" in shown and ("风险" in shown or "念出" in shown), "引用上文需提示被念出的风险"
+            summary = tts.render(mapped, out / "dry", dry_run=True, voices=override)
+            requests = load(out / "dry/requests.json")
+            assert requests == [tts.request_body(resolved["clips"][0]), tts.perform_body(resolved["clips"][1])]
+            assert all(isinstance(body, dict) and "body" not in body for body in requests), "requests 必须是平铺的请求体列表"
+            assert summary["tts"] == {"clips": 1, "characters": 3}
+            assert summary["perform"] == {"clips": 1, "takes": 2, "calls": 2, "characters": 3,
+                                           "estimated_seconds": 5.8}
+            assert summary["clips"] == 2 and summary["characters"] == 6
+            assert "1 元/分钟" in summary["perform_cost_note"]
+            routes = load(out / "dry/routes.json")
+            assert routes == summary["routes"]
+            assert [row["mode"] for row in routes] == ["tts", "perform"]
+            assert routes[1]["model"] == tts.PERFORM_MODEL and routes[1]["takes"] == 2
+            assert routes[1]["speaker"] == clone_voice and routes[1]["endpoint"] == tts.PERFORM_ENDPOINT
+            assert routes[0]["resource_id"] == "seed-tts-2.0" and routes[0]["takes"] == 1
+            switched = copy.deepcopy(mapped)
+            switched["enable_subtitle"] = False
+            switched["clips"][0]["enable_subtitle"] = True
+            for flag, expected in ((None, [True, False]), (True, [True, True]), (False, [False, False])):
+                tts.render(switched, out / "switch", dry_run=True, timestamps=flag, voices=override)
+                requests = load(out / "switch/requests.json")
+                assert [requests[0]["req_params"]["audio_params"]["enable_subtitle"],
+                        requests[1]["audio_config"]["enable_subtitle"]] == expected
+            for mode in ("tts", "perform"):
+                stats = tts.render(mapped, out / "filter-dry", dry_run=True, voices=override, only_mode=mode)
+                skipped = "perform" if mode == "tts" else "tts"
+                assert stats[skipped]["clips"] == 0 and stats[skipped]["characters"] == 0
+                if mode == "tts":
+                    assert stats["perform"]["calls"] == 0 and stats["perform"]["estimated_seconds"] == 0
+                assert len(load(out / "filter-dry/requests.json")) == 2
+            for mode in ("all", True, []):
+                fails(lambda: tts.render(mapped, out / "invalid-mode", dry_run=True,
+                                         voices=override, only_mode=mode), "only_mode 须使用官方枚举")
+            tts.save(out / "plan.json", mapped)
+            tts.save(out / "voices.json", override)
+            for command in ("preview", "render"):
+                args = ["tts.py", command, "--plan", str(out / "plan.json"), "--out", str(out / command),
+                        "--voices", str(out / "voices.json")]
+                if command == "render":
+                    args += ["--dry-run", "--only-mode", "perform", "--no-timestamps", "--debug-stream"]
+                output = io.StringIO()
+                with patch("sys.argv", args), redirect_stdout(output):
+                    assert tts.main() == 0
+                json.loads(output.getvalue())
+                if command == "render":
+                    requests = load(out / command / "requests.json")
+                    assert requests[1]["references"] == [{"speaker": clone_voice}]
+                    assert requests[1]["audio_config"]["enable_subtitle"] is False
+            assert not list(out.rglob("*.wav")) and not list(out.rglob("manifest.json"))
+        assert mapped == before and override == before_override, "解析/预览/dry-run 均不得修改输入"
+
+    def legacy_tts(out):
+        old_clip = clip("legacy", text="甲乙。", mode=None, voice=tts.VOICE)
+        old_clip.pop("resource_id", None)
+        old_plan = plan(old_clip)
+        expected = {"req_params": {"text": "甲乙。", "speaker": tts.VOICE,
+                    "audio_params": {"format": "pcm", "sample_rate": 24000, "speech_rate": 0,
+                                     "enable_subtitle": True},
+                    "additions": json.dumps({"disable_markdown_filter": True}, ensure_ascii=False)}}
+        assert tts.request_body(old_clip) == expected, "无 mode 的 v0.3.0 请求体必须原样不变"
+        fingerprint = hashlib.sha256(json.dumps(expected, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+        assert tts.request_fingerprint(expected, "seed-tts-2.0") == fingerprint
+        out.mkdir(parents=True)
+        (out / (fingerprint + ".wav")).write_bytes(wav(pcm()))
+        tts.save(out / (fingerprint + ".words.json"), {"text": "甲乙。", "words": [], "sentences": []})
+        tts.save(out / "manifest.json", {fingerprint: {"status": "complete"}})
+        with patch.object(tts.urllib.request, "build_opener", side_effect=AssertionError("旧 TTS 缓存不得失效")):
+            tts.render(old_plan, out)
+            assert load(out / "requests.json") == [expected]
+            old_clip["mode"] = "tts"
+            old_clip["explicit_language"] = None
+            tts.validate(old_plan, complete=True)
+            tts.render(old_plan, out)
+            assert load(out / "requests.json") == [expected], "TTS 的 explicit_language=null 旧行为保持不变"
+        assert len(load(out / "manifest.json")) == 1
+
+    def multitake_selection(out):
+        item = clip()
+        item["perform"].update(takes=2, selected_take=None)
+        script = plan(item)
+        snapshot = copy.deepcopy(script)
+        network = Network(out)
+        with patch.object(tts.urllib.request, "build_opener", side_effect=network.build):
+            summary = tts.render(script, out)
+            assert len(network.calls) == 2 and [c["take"] for c in network.calls] == [1, 2]
+            assert summary["pending_selection"] == [item["id"]] and summary["text_mismatch"] == []
+            timeline = load(out / "timeline.json")
+            segment = timeline["clips"][0]
+            assert segment["mode"] == "perform" and segment["take"] == 1
+            assert segment["take_selection"] == "provisional" and segment["text_match"] is True
+            assert abs(segment["rms_dbfs"] - 20 * math.log10(1000 / 32768)) < .01
+            assert read_pcm(out / "final.wav") == (24000, pcm(1000))
+            assert script == snapshot, "render 不得把 provisional 选择写回计划"
+            takes = load(out / "takes.json")
+            assert set(takes) == {item["id"]} and len(takes[item["id"]]) == 2
+            manifest = load(out / "manifest.json")
+            for take, row in enumerate(takes[item["id"]], 1):
+                fingerprint = fp(item, take)
+                assert row["take"] == take and row["fingerprint"] == fingerprint
+                assert row["original_duration"] == 1.75
+                path = Path(row["file"])
+                path = path if path.is_absolute() else out / path
+                assert path.resolve() == (out / "takes" / f"{item['id']}-take{take}.wav").resolve()
+                assert read_pcm(path) == (24000, pcm(1000 * take))
+                assert path.read_bytes() == (out / (fingerprint + ".wav")).read_bytes()
+                entry = manifest[fingerprint]
+                assert entry["status"] == "complete" and entry["take"] == take
+                assert entry["duration"] == 1.0 and entry["original_duration"] == 1.75
+                assert entry["logid"] == "offline-perform-logid" and entry["seconds"] >= 0
+                assert entry["text_match"] is True and entry["timestamps"] is True
+                assert "url" not in entry and entry.get("url_expire"), "只保留有效期，不保存临时 URL"
+            assert set(manifest) == {fp(item, 1), fp(item, 2)}, "manifest 保持 fp→entry 平铺结构"
+            assert tts.render(script, out) == summary and len(network.calls) == 2, "带字幕的 perform warm cache 必须零调用"
+            (out / "takes" / (item["id"] + "-take2.wav")).unlink()
+            tts.render(script, out)
+            assert len(network.calls) == 2 and (out / "takes" / (item["id"] + "-take2.wav")).exists()
+            item["perform"]["takes"] = 3
+            tts.render(script, out)
+            assert len(network.calls) == 3 and network.calls[-1]["take"] == 3, "增加 takes 只生成新 take"
+            assert len(load(out / "takes.json")[item["id"]]) == 3
+            item["perform"]["selected_take"] = 2
+            selected = tts.render(script, out)
+            assert len(network.calls) == 3 and selected["pending_selection"] == []
+            segment = load(out / "timeline.json")["clips"][0]
+            assert segment["take"] == 2 and segment["take_selection"] == "selected"
+            assert read_pcm(out / "final.wav") == (24000, pcm(2000)), "选 take 必须实际替换最终 PCM"
+            item["pause_after_ms"] = 100
+            tts.render(script, out)
+            assert len(network.calls) == 3 and read_pcm(out / "final.wav") == (26400, pcm(2000) + b"\0\0" * 2400)
+            with patch.object(tts.os, "environ", NoKeyEnvironment()):
+                stats = tts.render(script, out, dry_run=True)
+                assert stats["perform"]["calls"] == 3, "dry-run calls 是请求最大数，不因缓存变成零"
+            item["perform"]["prompt"] = "先冷笑，再轻声说"
+            tts.render(script, out)
+            assert len(network.calls) == 6, "改变请求体应生成所有 take"
+
+    def only_mode_and_offsets(out):
+        narration = clip("narration", mode="tts", voice=tts.VOICE)
+        narration.update(role="旁白", pause_after_ms=250)
+        acted = clip("acted")
+        acted["perform"].update(takes=2, selected_take=2)
+        script = plan(narration, acted)
+        network = Network(out)
+        with patch.object(tts.urllib.request, "build_opener", side_effect=network.build):
+            result = tts.render(script, out, only_mode="perform")
+            assert [c["mode"] for c in network.calls] == ["perform", "perform"]
+            assert all(result[name] is None for name in ("audio", "timeline", "srt"))
+            assert result["missing_clips"] == ["narration"]
+            assert not any((out / name).exists() for name in ("final.wav", "timeline.json", "final.srt")), "不能输出部分 final"
+            assert len(load(out / "requests.json")) == 2 and len(load(out / "takes.json")["acted"]) == 2
+            result = tts.render(script, out, only_mode="tts")
+            assert [c["mode"] for c in network.calls] == ["perform", "perform", "tts"]
+            assert all(result[name] for name in ("audio", "timeline", "srt")) and result.get("missing_clips", []) == []
+            timeline = load(out / "timeline.json")
+            assert timeline["duration"] == 2.25 and [c["offset"] for c in timeline["clips"]] == [0, 1.25]
+            assert [c["mode"] for c in timeline["clips"]] == ["tts", "perform"]
+            assert timeline["clips"][1]["take"] == 2 and timeline["clips"][1]["take_selection"] == "selected"
+            assert all(math.isfinite(c["rms_dbfs"]) for c in timeline["clips"])
+            assert timeline["words"][1]["startTime"] == 1.35 and timeline["words"][1]["endTime"] == 2.05
+            assert timeline["sentences"][1]["startTime"] == 1.35
+            assert "00:00:01,350 --> 00:00:02,050" in (out / "final.srt").read_text()
+            assert read_pcm(out / "final.wav") == (54000, pcm(3000) + b"\0\0" * 6000 + pcm(2000))
+            sidecar = load(out / (fp(acted, 2) + ".words.json"))
+            assert sidecar == {"text": "你好。", "words": [{"word": "你好。", "startTime": .1, "endTime": .8}],
+                               "sentences": [{"text": "你好。", "startTime": .1, "endTime": .8}]}, "毫秒转换及公共 sidecar 格式"
+            tts.render(script, out, only_mode="perform")
+            assert len(network.calls) == 3, "另一模式已有所选缓存也应拼接全计划"
+            acted["perform"]["selected_take"] = 1
+            tts.render(script, out, only_mode="tts")
+            assert len(network.calls) == 3 and read_pcm(out / "final.wav")[1].endswith(pcm(1000))
+            acted["perform"].update(takes=3, selected_take=3)
+            incomplete = tts.render(script, out, only_mode="tts")
+            assert len(network.calls) == 3 and incomplete["missing_clips"] == ["acted"]
+            assert all(incomplete[name] is None for name in ("audio", "timeline", "srt"))
+            assert not any((out / name).exists() for name in ("final.wav", "timeline.json", "final.srt")), "缺所选 take 时清除旧 final，避免交付残留"
+        fresh = out / "tts-first"
+        network = Network(fresh)
+        with patch.object(tts.urllib.request, "build_opener", side_effect=network.build):
+            result = tts.render(script, fresh, only_mode="tts")
+            assert [call["mode"] for call in network.calls] == ["tts"]
+            assert result["missing_clips"] == ["acted"]
+            assert all(result[name] is None for name in ("audio", "timeline", "srt"))
+            assert not (fresh / "final.wav").exists()
+
+    def cache_preflight(out):
+        later = clip("later")
+        later["perform"]["takes"] = 2
+        cached = plan(later)
+        network = Network(out)
+        with patch.object(tts.urllib.request, "build_opener", side_effect=network.build):
+            tts.render(cached, out)
+        preceding = clip("new-first", mode="tts", voice=tts.VOICE)
+        mixed = plan(preceding, later)
+        audio = out / (fp(later, 2) + ".wav")
+        sidecar = out / (fp(later, 2) + ".words.json")
+        original_audio, original_sidecar = audio.read_bytes(), sidecar.read_text()
+        with patch.object(tts.urllib.request, "build_opener", side_effect=AssertionError("全部缓存预检必须早于新请求")) as blocked:
+            audio.write_bytes(original_audio[:-2])
+            fails(lambda: tts.render(mixed, out), "损坏后段 take WAV 应先阻断")
+            audio.write_bytes(original_audio)
+            for contents in ("{", "[]", '{"text":"你好。","words":[{"word":"你好。","startTime":0,"endTime":9}],"sentences":[]}'):
+                sidecar.write_text(contents)
+                fails(lambda: tts.render(mixed, out), "损坏 perform 字幕缓存必须先阻断")
+            sidecar.unlink()
+            fails(lambda: tts.render(mixed, out), "缺失 perform 字幕缓存必须先阻断")
+            sidecar.write_text(original_sidecar)
+            entries = load(out / "manifest.json")
+            entries[fp(later, 2)]["status"] = "uncertain"
+            tts.save(out / "manifest.json", entries)
+            fails(lambda: tts.render(mixed, out), "后段 uncertain 必须在新 TTS/perform 调用前阻断")
+            assert blocked.call_count == 0
+
+    def downmix_debug(out):
+        stereo = struct.pack("<hhhh", 1000, 3000, -1000, -3000) * 12000
+        encoded = payload(wav(stereo, channels=2), code=20000000)
+        signed_url = encoded["url"]
+        encoded.update(message="echo " + secret + " audio=" + encoded["audio"] + " url=" + signed_url,
+                       nested={"X-Api-Key": secret, "token": "second-offline-secret",
+                               "description": "audio=" + encoded["audio"] + " url=" + signed_url,
+                               "notes": ["repeated token=second-offline-secret", {"echo": signed_url}]})
+        network = Network(out, lambda call: encoded)
+        logs = io.StringIO()
+        with patch.object(tts.urllib.request, "build_opener", side_effect=network.build), redirect_stderr(logs):
+            summary = tts.render(plan(), out, debug_stream=True)
+            tts.render(plan(), out)
+        assert len(network.calls) == 1 and summary["pending_selection"] == []
+        assert read_pcm(out / "final.wav") == (24000, struct.pack("<hh", 2000, -2000) * 12000)
+        segment = load(out / "timeline.json")["clips"][0]
+        assert segment["take_selection"] == "single" and segment["take"] == 1
+        assert abs(segment["rms_dbfs"] - 20 * math.log10(2000 / 32768)) < .01
+        entry = load(out / "manifest.json")[fp(clip())]
+        assert entry["downmixed"] is True and entry["original_duration"] == 1.75
+        assert encoded["audio"] not in logs.getvalue() and secret not in logs.getvalue()
+        assert signed_url not in logs.getvalue(), "临时 URL 在 message/嵌套诊断里重复也必须脱敏"
+        assert "second-offline-secret" not in logs.getvalue() and "subtitle" in logs.getvalue()
+        assert str(len(encoded["audio"])) in logs.getvalue(), "perform 调试将 base64 换成长度"
+        assert encoded["url"] not in (out / "manifest.json").read_text(), "不能保存或下载临时 URL"
+
+    def response_errors(out):
+        missing_code = {name: value for name, value in payload().items() if name != "code"}
+        directory = out / "missing-code-success"
+        network = Network(directory, lambda call: missing_code)
+        with patch.object(tts.urllib.request, "build_opener", side_effect=network.build):
+            result = tts.render(plan(), directory)
+            assert result["audio"] and result["timestamps"] is True and result["text_mismatch"] == []
+            assert read_pcm(directory / "final.wav") == (24000, pcm(1000))
+            entry = load(directory / "manifest.json")[fp(clip())]
+            assert entry["status"] == "complete" and entry["text_match"] is True
+            assert entry["http_status"] == 200 and entry["response_code_present"] is False
+            assert entry["response_code"] is None, "缺失 code 不应被记录成服务返回的成功码"
+            assert tts.render(plan(), directory) == result and len(network.calls) == 1, "HTTP 200 无 code 的有效 WAV 响应也缓存，不重复计费"
+        errors = [
+            ("empty", {**payload(), "audio": ""}),
+            ("missing-audio", {key: value for key, value in payload().items() if key != "audio"}),
+            ("bad-base64", {**payload(), "audio": "not!base64"}),
+            ("pcm-not-wav", payload(pcm())),
+            ("truncated-wav", payload(wav(pcm())[:-2])),
+            ("rate", payload(wav(pcm(), rate=16000))),
+            ("width", payload(wav(b"\x01" * 24000, width=1))),
+            ("channels", payload(wav(struct.pack("<hhh", 1, 2, 3) * 24000, channels=3))),
+            ("code", payload(code=45001125)),
+            ("null-code", payload(code=None)),
+            ("false-code", payload(code=False)),
+            ("true-code", payload(code=True)),
+            ("string-zero-code", payload(code="0")),
+            ("string-success-code", payload(code="20000000")),
+            ("float-zero-code", payload(code=0.0)),
+            ("float-success-code", payload(code=20000000.0)),
+            ("missing-code-empty-audio", {**missing_code, "audio": ""}),
+            ("missing-code-invalid-wav", {**missing_code, "audio": base64.b64encode(pcm()).decode()}),
+            ("json", b"{not-json"),
+            ("http400", tts.urllib.error.HTTPError(tts.PERFORM_ENDPOINT, 400, "Bad Request", {},
+                io.BytesIO(json.dumps({"code": 45001125, "message": "文本审核失败 " + secret}).encode()))),
+            ("transport", OSError("offline synthetic connection failure"))]
+        for name, failure in errors:
+            directory = out / name
+            network = Network(directory, lambda call, failure=failure: failure)
+            logs = io.StringIO()
+            with patch.object(tts.urllib.request, "build_opener", side_effect=network.build), redirect_stderr(logs):
+                fails(lambda: tts.render(plan(), directory, debug_stream=True), "错误响应必须停止：" + name)
+                assert len(network.calls) == 1
+                entry = load(directory / "manifest.json")[fp(clip())]
+                assert entry["status"] == "uncertain" and "error_type" in entry
+                if name == "http400":
+                    assert entry["error_code"] == 45001125 and "文本审核失败" in entry["error_message"]
+                    assert secret not in entry["error_message"]
+                assert not (directory / "final.wav").exists(), "错误响应不得交付最终音频"
+                fails(lambda: tts.render(plan(), directory), "uncertain 不得自动重发：" + name)
+                assert len(network.calls) == 1
+                network.respond = lambda call: payload()
+                result = tts.render(plan(), directory, retry_uncertain=True)
+                assert len(network.calls) == 2 and result["audio"]
+                assert load(directory / "manifest.json")[fp(clip())]["status"] == "complete"
+                tts.render(plan(), directory)
+                assert len(network.calls) == 2
+            assert secret not in logs.getvalue(), "失败调试日志也必须脱敏"
+            if isinstance(failure, dict) and failure.get("audio"):
+                assert failure["audio"] not in logs.getvalue(), "失败调试日志不得输出 base64"
+        directory = out / "take-two-uncertain"
+        item = clip()
+        item["perform"]["takes"] = 2
+        script = plan(item)
+        network = Network(directory, lambda call: payload(wav(pcm(1000))) if call["take"] == 1
+                          else OSError("offline take-two failure"))
+        with patch.object(tts.urllib.request, "build_opener", side_effect=network.build):
+            fails(lambda: tts.render(script, directory), "后续 take 失败不得自动重试或交付 partial final")
+            assert [call["take"] for call in network.calls] == [1, 2]
+            entries = load(directory / "manifest.json")
+            assert entries[fp(item, 1)]["status"] == "complete" and entries[fp(item, 2)]["status"] == "uncertain"
+            assert not (directory / "final.wav").exists()
+            fails(lambda: tts.render(script, directory), "后续 uncertain take 仍须授权重试")
+            assert len(network.calls) == 2
+            network.respond = lambda call: payload(wav(pcm(2000)))
+            tts.render(script, directory, retry_uncertain=True)
+            assert [call["take"] for call in network.calls] == [1, 2, 2], "重试只能补失败 take，不能再次计费已完成 take"
+            assert read_pcm(directory / "final.wav") == (24000, pcm(1000))
+        # 无 code 的有效 WAV body 也不能绕过 HTTP 200 要求。
+        directory = out / "http503"
+        network = Network(directory)
+        class FailedResponse(Response):
+            status = 503
+            code = 503
+        def unavailable(request, timeout):
+            return FailedResponse(json.dumps(missing_code).encode())
+        with patch.object(tts.urllib.request, "build_opener", return_value=network), patch.object(
+                network, "open", side_effect=unavailable):
+            fails(lambda: tts.render(plan(), directory), "HTTP 非 200 不得当成功")
+        assert load(directory / "manifest.json")[fp(clip())]["status"] == "uncertain"
+
+    def subtitle_cases(out):
+        cases = [("punctuation", "你好！", True), ("mismatch", "哈哈哈你好。", False)]
+        for name, text, match in cases:
+            directory = out / name
+            network = Network(directory, lambda call, text=text: payload(text=text))
+            with patch.object(tts.urllib.request, "build_opener", side_effect=network.build):
+                result = tts.render(plan(), directory)
+                assert result["text_mismatch"] == ([] if match else [{"clip": "perform", "take": 1}])
+                assert result["timestamps"] is True and result["audio"]
+                entry = load(directory / "manifest.json")[fp(clip())]
+                assert entry["status"] == "complete" and entry["text_match"] is match
+                assert load(directory / "timeline.json")["clips"][0]["text_match"] is match
+                assert text in (directory / "final.srt").read_text()
+                assert tts.render(plan(), directory) == result and len(network.calls) == 1
+        for name, root_text, sentence_text in (("root-match-sentence-mismatch", "Hello.", "Bye."),
+                                                ("root-mismatch-sentence-match", "Bye.", "Hello.")):
+            item = clip(text="Hello.")
+            response = payload(text=root_text)
+            sentence = response["subtitle"]["sentences"][0]
+            sentence["text"] = sentence_text
+            sentence["words"][0]["text"] = sentence_text
+            directory = out / name
+            network = Network(directory, lambda call, response=response: response)
+            with patch.object(tts.urllib.request, "build_opener", side_effect=network.build):
+                result = tts.render(plan(item), directory)
+                assert result["text_mismatch"] == [{"clip": item["id"], "take": 1}]
+                assert result["timestamps"] is True and result["audio"], "字幕文字不一致只警告，不废弃有效时间戳"
+                entry = load(directory / "manifest.json")[fp(item)]
+                assert entry["status"] == "complete" and entry["text_match"] is False
+                segment = load(directory / "timeline.json")["clips"][0]
+                assert segment["text_match"] is False and segment["subtitle_text"] == sentence_text
+                assert sentence_text in (directory / "final.srt").read_text()
+                assert tts.render(plan(item), directory) == result and len(network.calls) == 1
+        item = clip(text="华老栓。")
+        for row in item["readings"]:
+            if row["text"] == "华":
+                row.update(pinyin=["hua4"], delivery="spoken_alias", spoken_alias="桦", alias_approved=True)
+        directory = out / "submitted-alias"
+        network = Network(directory, lambda call: payload(text="桦老栓。"))
+        with patch.object(tts.urllib.request, "build_opener", side_effect=network.build):
+            assert tts.render(plan(item), directory)["text_mismatch"] == []
+        timeline = load(directory / "timeline.json")
+        assert timeline["clips"][0]["text"] == "华老栓。" and timeline["clips"][0]["subtitle_text"] == "桦老栓。"
+        invalid = payload()
+        invalid["subtitle"]["sentences"][0]["words"][0]["end_time"] = 9000
+        malformed = payload()
+        malformed["subtitle"]["sentences"][0]["words"][0]["start_time"] = "100"
+        absent = {key: value for key, value in payload().items() if key != "subtitle"}
+        fallback_cases = [("invalid", invalid, "invalid_subtitles"),
+                          ("malformed", malformed, "invalid_subtitles"),
+                          ("absent", absent, "not_returned")]
+        huge = json.loads("1" + "0" * 400)
+        assert huge == 10 ** 400, "JSON 可解析但转换秒数会溢出的毫秒整数"
+        for level in ("sentence", "word"):
+            for name in ("start_time", "end_time"):
+                overflowing = payload()
+                sentence = overflowing["subtitle"]["sentences"][0]
+                target = sentence if level == "sentence" else sentence["words"][0]
+                target[name] = huge
+                fallback_cases.append(("overflow-" + level + "-" + name, overflowing, "invalid_subtitles"))
+        for name, response, reason in fallback_cases:
+            directory = out / name
+            network = Network(directory, lambda call, response=response: response)
+            with patch.object(tts.urllib.request, "build_opener", side_effect=network.build):
+                result = tts.render(plan(), directory)
+                assert result["audio"] and result["timestamps"] is False
+                assert read_pcm(directory / "final.wav") == (24000, pcm(1000)), "字幕校验失败不得损失完整音频"
+                assert (directory / "final.srt").read_text() == ""
+                entry = load(directory / "manifest.json")[fp(clip())]
+                assert entry["status"] == "complete" and entry["timestamps_reason"] == reason
+                tts.render(plan(), directory)
+                assert len(network.calls) == 1, "字幕降级音频仍应缓存，不能自动重做"
+        item = clip()
+        item["enable_subtitle"] = False
+        directory = out / "disabled"
+        network = Network(directory, lambda call: payload(text="额外台词。"))
+        with patch.object(tts.urllib.request, "build_opener", side_effect=network.build):
+            result = tts.render(plan(item), directory)
+            assert result["text_mismatch"] == [] and result["timestamps"] is False
+            entry = load(directory / "manifest.json")[fp(item)]
+            assert entry["text_match"] is None and entry["timestamps_reason"] == "disabled"
+            assert load(directory / "timeline.json")["clips"][0]["text_match"] is None
+            tts.render(plan(item), directory)
+            assert len(network.calls) == 1, "关闭字幕的 perform 缓存也复用公共缓存适配器"
+
+    checks = [("body/validation", body_validation), ("voices/dry-run/preview/CLI", voices_dry_preview),
+              ("legacy TTS", legacy_tts), ("multi-take selection/cache", multitake_selection),
+              ("only-mode/full joins/subtitle offsets", only_mode_and_offsets),
+              ("cache preflight", cache_preflight), ("WAV downmix/debug", downmix_debug),
+              ("response errors/uncertain/retry", response_errors), ("subtitles/mismatch/fallback", subtitle_cases)]
+    failures = []
+    with tempfile.TemporaryDirectory(prefix="volce-perform-check-") as directory, patch.dict(
+            os.environ, {"VOLC_TTS_API_KEY": secret}, clear=True), patch.object(
+            tts.urllib.request, "build_opener", side_effect=AssertionError("perform 回归不得联网")), patch.object(
+            tts.urllib.request, "urlopen", side_effect=AssertionError("不得绕过 build_opener 或下载 URL")):
+        for index, (name, check) in enumerate(checks):
+            try:
+                check(Path(directory) / str(index + 1))
+            except Exception as exc:
+                failures.append(f"{name}: {type(exc).__name__}: {exc}\n" + traceback.format_exc())
+        for path in Path(directory).rglob("*.json"):
+            assert secret not in path.read_text(), "持久 JSON 不得泄露密钥：" + str(path)
+    if failures:
+        raise AssertionError("perform_checks 回归失败：\n" + "\n".join(failures))
+
+
 def demo():
     plan = json.loads((ROOT / "examples/chinese/plan.json").read_text(encoding="utf-8"))
     text = "".join(c["text"] for c in plan["clips"])
@@ -1142,7 +1870,8 @@ def demo():
     timestamp_checks()
     timestamp_review_checks()
     mixed_checks()
-    print("PASS：中文校对、中英混读、发音表/品牌提示/缩写/型号、原文与英语词时间戳保留、纠音冲突、语音指令与引用上文、方言、断流、预览、预置/克隆资源接线、WAV与新旧缓存、字幕晚到与脱敏、逐字时间线、句级 SRT、字幕开关与降级、十项时间戳评审回归")
+    perform_checks()
+    print("PASS：中文校对、中英混读、发音表/品牌提示/缩写/型号、原文与英语词时间戳保留、纠音冲突、语音指令与引用上文、方言、断流、预览、预置/克隆资源接线、WAV与新旧缓存、字幕晚到与脱敏、逐字时间线、句级 SRT、字幕开关与降级、十项时间戳评审回归、情绪演绎校验/音色映射/请求路由/多 take 缓存与选择/only-mode/下混/字幕与错误回归")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,48 @@
+{
+  "title": "旁白与白骨精冷笑：v0.4.0 本地演绎示例（未真实合成验收）",
+  "enable_subtitle": true,
+  "voices": {
+    "旁白": "zh_male_youyoujunzi_uranus_bigtts",
+    "白骨精": "zh_female_vv_uranus_bigtts"
+  },
+  "clips": [
+    {
+      "id": "narration",
+      "role": "旁白",
+      "mode": "tts",
+      "text": "夜色渐深，白骨精现身。",
+      "direction": "平静、克制地叙述，语速稍慢，不添加音效。",
+      "speech_rate": -10,
+      "pause_after_ms": 300,
+      "readings": [
+        {"start": 0, "text": "夜色", "pinyin": ["ye4", "se4"], "status": "reviewed", "delivery": "native", "note": "夜晚的景色，色读 sè；校对不代表已试听"},
+        {"start": 2, "text": "渐", "pinyin": ["jian4"], "status": "reviewed", "delivery": "native", "note": "逐渐变深，读 jiàn"},
+        {"start": 5, "text": "白骨精", "pinyin": ["bai2", "gu3", "jing1"], "status": "reviewed", "delivery": "native", "note": "人物名，骨读 gǔ，精读 jīng"},
+        {"start": 8, "text": "现身", "pinyin": ["xian4", "shen1"], "status": "reviewed", "delivery": "native", "note": "出现身影，身读 shēn"}
+      ]
+    },
+    {
+      "id": "bgj-laugh",
+      "role": "白骨精",
+      "mode": "perform",
+      "text": "嘻嘻嘻……听说吃上唐僧一块肉，就能长生不老。",
+      "perform": {
+        "prompt": "先压低嗓子发出三声尖细的冷笑，笑完停半拍，再贪婪又得意地低声说，拖长句末尾音",
+        "takes": 3,
+        "selected_take": null,
+        "ambience": false
+      },
+      "speech_rate": 0,
+      "pause_after_ms": 300,
+      "readings": [
+        {"start": 0, "text": "嘻嘻嘻", "pinyin": ["xi1", "xi1", "xi1"], "status": "reviewed", "delivery": "native", "note": "稿面笑声读 xī；是否生成自然冷笑须试听"},
+        {"start": 5, "text": "听说", "pinyin": ["ting1", "shuo1"], "status": "reviewed", "delivery": "native", "note": "听人说，读 tīng shuō"},
+        {"start": 7, "text": "吃上", "pinyin": ["chi1", "shang4"], "status": "reviewed", "delivery": "native", "note": "得以吃到，上读 shàng"},
+        {"start": 9, "text": "唐僧", "pinyin": ["tang2", "seng1"], "status": "reviewed", "delivery": "native", "note": "人物名，僧读 sēng"},
+        {"start": 11, "text": "一块肉", "pinyin": ["yi2", "kuai4", "rou4"], "status": "reviewed", "delivery": "native", "note": "一在第四声块之前变调为 yí，保留自然连读"},
+        {"start": 16, "text": "能", "pinyin": ["neng2"], "status": "reviewed", "delivery": "native", "note": "能够，读 néng"},
+        {"start": 17, "text": "长生不老", "pinyin": ["chang2", "sheng1", "bu4", "lao3"], "status": "reviewed", "delivery": "native", "note": "长久活着，长读 cháng；不在第三声老前保留 bù"}
+      ]
+    }
+  ]
+}

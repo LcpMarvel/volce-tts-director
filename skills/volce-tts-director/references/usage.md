@@ -40,13 +40,13 @@ uv run scripts/tts.py render --plan plan.json --out 音频
 
 上面仅演示字段；实际候选以扫描结果为准。标注可覆盖单字或词组，不能重叠。每个词组最多 9 个汉字，每个字一个拼音。替换词组标注时删除已覆盖的单字标注。请求采用官方 `additions` JSON 字符串里的 `pronunciation_dict.tone`，例如 `银行/(yin2)(hang2)`；同词规则去重，并模拟贪心最长匹配，验证每个已校对位置实际得到指定读音。显示注音不改变 `req_params.text`；已授权的客户端可听别名除外。
 
-只允许官方固定端点 `https://openspeech.bytedance.com/api/v3/tts/unidirectional`，资源限定 `seed-tts-2.0`（`zh_` 预置音色）和 `seed-icl-2.0`（`S_` 已有克隆音色），不隐式代理到其他供应商。可用音色以用户控制台权限为准；离线检查只验证 ID 格式和本工具的资源组合，不能证明账号权限、训练状态或中文发音效果。
+普通 TTS 只允许官方固定端点 `https://openspeech.bytedance.com/api/v3/tts/unidirectional`，资源限定 `seed-tts-2.0`（`zh_` 预置音色）和 `seed-icl-2.0`（`S_` 已有克隆音色），不隐式代理到其他供应商。可用音色以用户控制台权限为准；离线检查只验证 ID 格式和本工具的资源组合，不能证明账号权限、训练状态或中文发音效果。
 
-`speech_rate` 为整数 -50～100（0 为正常）；`pause_after_ms` 为本地拼接停顿，0～30000 毫秒；`direction` 写中文导演说明。请求输出 24kHz 单声道 PCM，使用 Python 标准库包装成 WAV、顺序拼接，无需 ffmpeg。正式调用保存无凭据的请求、请求 ID、服务端 logid、用量与耗时。默认启用逐字字幕，输出片段 `*.words.json`、全片 `timeline.json` 和句级 `final.srt`；未返回字幕时明确标记，不虚构时间戳，详见 [逐字时间戳与字幕](#逐字时间戳与字幕)。
+`speech_rate` 为整数 -50～100（0 为正常）；`pause_after_ms` 为本地拼接停顿，0～30000 毫秒；`direction` 写中文导演说明。普通 TTS 请求输出 24kHz 单声道 PCM，使用 Python 标准库包装成 WAV、顺序拼接，无需 ffmpeg。正式调用保存无凭据的请求、请求 ID、服务端 logid、用量与耗时。默认启用逐字字幕，输出片段 `*.words.json`、全片 `timeline.json` 和句级 `final.srt`；未返回字幕时明确标记，不虚构时间戳，详见 [逐字时间戳与字幕](#逐字时间戳与字幕)。
 
 输出目录必须由当前任务独占。`render` 顺序调用，先验证全部段，再调用 API；完成段按实际请求内容复用。`manifest.json` 的 `uncertain` 表示调用结果不确定，默认不再次发送。先核对服务记录、预算与用户授权，只有允许再调用时加 `--retry-uncertain`。不要在同一输出目录同时启动两个 render。
 
-本实现保守要求流式完成码 `20000000`、非空偶数字节 PCM；没有完成码的流不会发布为成功。错误停止，保留已完成片段，不静默重试。阅读稿始终是审稿材料，是否已生成以音频目录的 manifest 为准。
+普通 TTS 路由保守要求流式完成码 `20000000`、非空偶数字节 PCM；没有完成码的流不会发布为成功。错误停止，保留已完成片段，不静默重试。阅读稿始终是审稿材料，是否已生成以音频目录的 manifest 为准。
 
 在源码仓库根目录执行本地检查（安装后的 skill 不包含开发测试）：
 
@@ -55,6 +55,176 @@ uv run --with pypinyin==0.55.0 python tests/selfcheck.py
 ```
 
 协议依据（2026-09-30 核对）：[火山官方 HTTP 接口](https://docs.volcengine.com/docs/DoubaoVoice/unidirectional-streaming-text-to-speech-http?lang=zh)；候选词典行为：[pypinyin 官方文档](https://github.com/mozillazg/python-pinyin/blob/master/docs/usage.rst)。本工具不保证词典完整或模型遵循指令，正式生成后仍需试听多音字所在句。
+
+## 情绪演绎模式
+
+**v0.4.0 新增；一个 S_ 样本已完成真实协议核对，用户试听认为该冷笑短句的 perform 效果明显优于 TTS。** 官方音频生成 HTTP 页面正文已于 **2026-10-12** 在线复核（列出 18 种语言）；同日按用户授权进行了 perform / TTS 短样调用，观察见下方记录。这条试听反馈只适用于本次样本；真实返回成功、结构校验与 mock 本身不证明音色身份、发音或演绎效果。后续真实调用仍须遵守用户授权的调用次数与预算。
+
+普通 TTS 行为不变：省略 `mode` 等于 `"tts"`，仍走 `/api/v3/tts/unidirectional`，旧请求、指纹和缓存保持不变。笑、哭出声、尖叫、叹气、冷笑、打滚喊疼等副语言，或已有 `S_` 音色的强情绪句，可手动改为 `"perform"`，走固定 `POST https://openspeech.bytedance.com/api/v3/tts/create`、`model: "seed-audio-1.0"`。预置 2.0 音色的整体情绪先试 `direction`。`prepare` 不改，模式由 Agent 在校对阶段手动标记。
+
+新版 API 文档列出 **18 种语言**；本地 v0.4.0 仅接受中文、英文及中英混读，`explicit_language` 仅为 `zh-cn / en`。这是本地验证与工作流范围，不能写成 seed-audio 模型只支持中英文；本版本也不保证纯方言，方言口音效果须试听。
+
+### 完整字段与限制
+
+| 字段 | perform 用法 |
+| --- | --- |
+| 顶层 `voices` | 可选的角色 → 音色 ID 对象；两种模式共用，见下节 |
+| `id` / `role` | 唯一片段 ID（字母数字、短横线、下划线，1～64 字符）；role 用于导演说明与角色映射 |
+| `mode` | 省略或 `"tts"` 为旧行为；`"perform"` 才允许 `perform` 对象，tts 携带该对象会报错 |
+| `perform.prompt` | 必填、1～500 字符，写能听见的动作、顺序与语气，不包含台词；最终拼好的 `text_prompt` 不超过 3000 字符 |
+| `perform.takes` | 1～4 的整数，默认 **1**；每个 take 都是独立计费调用，不自动重试 |
+| `perform.selected_take` | `null`（默认）或 1～takes 的整数；takes > 1 且 null 时暂用 take 1，须人工试听后选择；takes = 1 视为 single |
+| `perform.ambience` | 布尔值，默认 **false**，自动加入只要人声干声的约束；true 仅移除此约束，允许模型混合环境声，不提供分轨 |
+| `voice` | 可显式填写，或按 role 从映射解析；接受有权限的 2.0 `zh_` 预置 / 已有 `S_` 复刻 ID，放入 `references[0].speaker`，不能把体验中心昵称当 ID |
+| `resource_id` | 可省略；填写时仍按原规则校验与音色一致（zh_ / seed-tts-2.0，S_ / seed-icl-2.0），但不发送到 perform 请求或请求头 |
+| `text` | 只存台词，最多 **400 字符**，超长明确拆段；这是本地保守策略，官方人声文本建议值不是模型语言上限 |
+| `direction` | 可选字符串，作为角色整体语气放在 perform.prompt 前 |
+| `reference_text` | 可选真实上文，本地上限 500 字符；加“只用于理解情绪，不要念出来”说明，仍有被模型串读风险，必须试听 |
+| `speech_rate` | -50～100 的整数，0 正常，映射到 `audio_config.speech_rate` |
+| `pause_after_ms` | 0～30000 的整数，本地段后停顿；不裁剪模型原有首尾静音 |
+| `readings` | 扫描候选须全部按语境 reviewed；native 仅展示；instruction 转成 prompt 发音要求；已授权 spoken_alias 替换提交文本并附发音要求 |
+| `readings[].delivery: dictionary` | **拒绝**，不能把 TTS 发音字典发送到 perform；旧标注省略 delivery 会默认字典，须明确改为 native / instruction / 已授权 spoken_alias |
+| `pronunciation_dict` | 不支持有效发音字典规则；改用上述投递方式，或把该句留在 TTS |
+| 顶层 `pronunciation_table` | 命中的 acronyms / models 字典转写拒绝，不静默删除；words 的英语读音提示转为 prompt 的发音要求，null 保留原生读法 |
+| `explicit_dialect` / `enable_latex_tn` / `section_id` | perform 不支持，移除字段，不用空值或 false 当作后备；方言口音可写入 prompt，效果未验证 |
+| `explicit_language` | 仅接受 zh-cn / en，本地校验后不发送；含中文不能强制为 en |
+| `enable_subtitle` | 映射到 `audio_config.enable_subtitle`；CLI --timestamps / --no-timestamps > clip > 顶层 > true |
+| watermark | 本版本不增加请求字段或开关；发布 AI 内容的显式标识/元数据合规须按目的地要求处理，不能以未发送字段代替合规判断 |
+
+### 同一角色共用音色映射
+
+计划顶层可以写：
+
+```json
+{
+  "voices": {
+    "旁白": "zh_male_youyoujunzi_uranus_bigtts",
+    "白骨精": "zh_female_vv_uranus_bigtts"
+  }
+}
+```
+
+`preview / render --voices FILE` 读取同结构的**裸映射对象**（不是含 voices 键的计划）。[examples/voices.example.json](../../../examples/voices.example.json) 是买家模板：
+
+```json
+{
+  "旁白": "S_替换成你的复刻音色ID",
+  "白骨精": "S_替换成你的复刻音色ID"
+}
+```
+
+先填自己的 ID；占位值会报“请填写自己的音色”，不是可合成 ID。**解析优先级：clip 显式 voice > CLI 文件映射 > 计划顶层映射**。CLI 按角色覆盖计划映射，未覆盖角色继续使用计划值；若片段已写死 voice，要移除它才会用角色映射。缺少角色时在联网前报错并列出缺项。解析结果进入请求体与缓存指纹，两种模式不能另配独立音色；但 ID 相同不保证听感相同，首次仍需按授权做同角色的 TTS / perform 短句 A/B 试听。
+
+### prompt 模板与请求
+
+Agent 只编辑字段，由脚本拼出以下模板；不要自行把注音阅读稿或整段模板复制进 text / perform.prompt。条件行只在对应字段存在时加入：
+
+```text
+@音频1 是“{role}”的音色，全程只用这个音色。
+{role}的整体语气：{direction}
+上文（只用于理解情绪，不要念出来）：{reference_text}
+{role}（参考 @音频1）{perform.prompt}：“{提交文本}”
+发音要求：{instruction / 英语读音提示}
+只生成这一个角色的人声干声，不要背景音乐、环境声或音效，不要添加台词以外的话。
+```
+
+最后一行只在 ambience=false 时加入。示例动作可以是“先压低嗓子发出三声尖细冷笑，停半拍，再拖长尾音、低声说”；台词仍只在 text。实际提交文本只应用已授权的 spoken_alias，原稿保留。方向、上文或发音提示也可能被模型忽略或念出，preview / requests.json 只证明接线，不能替代试听。
+
+请求体示意（非真实成功响应证据）：
+
+```json
+{
+  "model": "seed-audio-1.0",
+  "text_prompt": "由上述模板生成的完整字符串",
+  "references": [{"speaker": "解析后的音色ID"}],
+  "audio_config": {
+    "format": "wav",
+    "sample_rate": 24000,
+    "speech_rate": 0,
+    "enable_subtitle": true
+  }
+}
+```
+
+依据提供的文档，perform 采用 X-Api-Key（运行时 VOLC_TTS_API_KEY），可附 X-Api-Request-Id，不发送 X-Api-Resource-Id；控制台须另开通**豆包音频生成模型 1.0**及音色权限。相同密钥是否对账号可用须核对，dry-run 不读取密钥。只允许上述固定端点、拒绝重定向，顺序调用，不自动换资源、重试或并发。参考仅为 speaker ID，本版不上传参考音频、图片，也不做音色设计。
+
+**响应规则与实测边界：**官方 speaker 示例的 prompt 没有 @音频1；本地带该标记及一个获授权 S_ speaker 的请求已实际返回音频，说明该组合被接受并生成，**不证明引用标记的语义绑定或音色身份**。官方 schema 列 code / message，但 HTTP 200 示例省略 code；2026-10-12 的真实 perform 响应也未包含 code，已据此修正本地处理：**仅 HTTP 200 且 audio 可解码为有效非空 WAV 时允许缺 code**；若字段存在，只接受严格整数 0 / 20000000，null、布尔、字符串及错误码均拒绝。实际观察到的是缺 code，不是上述成功码取值；HTTP 200 本身不是成功的充分条件。manifest 记录 http_status、response_code_present、response_code，区分缺字段与返回 null。请求超时暂设 300 秒（官方 curl 示例同为 --max-time 300），不保证实际生成耗时。
+
+### 真实核对记录（2026-10-12）
+
+仅使用一个获授权的 S_ 音色，同音色、同台词生成 perform 与普通 TTS；不披露真实音色 ID、请求 ID 或 logid，不依赖未入库的本地产物路径。
+
+- 第一次 perform 已返回音频、duration / original_duration 均为 **6.30 秒**及匹配字幕，但没有 code；当时旧严格检查使本地失败，状态保留 uncertain，未保存音频。用户随后**另行明确授权一次重试**，没有自动重试。
+- 重试 perform 为 HTTP 200、仍无 code，manifest 记录 response_code_present=false；有效 WAV 校验通过后保存。duration / original_duration 均为 **5.18 秒**，服务端 WAV 为 **24 kHz / 16-bit / 双声道**，逐帧平均下混为单声道，记 downmixed=true；不是接口保证单声道。
+- 同音色、同台词的 TTS 独立成功，时长 **2.1866667 秒**；本地停顿合计 **0.70 秒**，最终 WAV **8.0666667 秒**，TTS 段 offset 为 **5.88 秒**。perform 字幕毫秒转秒并加拼接偏移已核对，两个片段 timestamps=true，perform 的 text_match=true；这些是结构/文字核对，不是听审结论。
+- 整段 RMS：perform **-28.833 dBFS**、TTS **-19.567 dBFS**，差约 **9.266 dB**。此指标含静音，不等于主观响度差；未归一、未裁剪或自动修正音频。
+- 共 **3 次真实调用：2 次 perform（含首次本地失败）+ 1 次 TTS**。两次 perform 的 original_duration 合计 **11.48 秒**可能计费，本地失败不意味着供应商免费；实际账单、额度消耗与 TTS 费用以控制台为准。
+- **用户试听后确认该冷笑样本的 perform 效果明显优于 TTS；此轮没有预置 zh_ perform 样本。** 该反馈不单独证明 @音频1 的语义绑定、音色身份/相似度或干声质量，也不能推广到其他场景；不从 code 缺失兼容、text_match 或 WAV 结构推断听感通过。
+
+### takes、缓存与交付流程
+
+1. 先校对全部 readings，preview 展示原文、导演动作、读音投递与解析后的音色；再 dry-run 审阅请求，说明收费调用上界与预算。示例 [examples/perform/plan.json](../../../examples/perform/plan.json) 是一段旁白 TTS + 一句白骨精冷笑 perform（3 takes，尚未真实合成）。
+2. 用户授权后生成全部 take，不自动挑选。每条 take 独立指纹，绑定 endpoint、model、实际 body 和 1 起的 take 编号；音频与字幕按 `<fingerprint>.wav / .words.json` 缓存。另存 `takes/<clip_id>-take<k>.wav`（链接或复制）供试听，`takes.json` 列出 take、fingerprint、file、original_duration。
+3. 多 take 且 selected_take=null 时，暂用 take 1 拼接，timeline 的 take_selection 为 provisional，结果列 pending_selection。用户试听后写入所选编号，在**同一输出目录**再 render，已完成 take 不重复收费，只重拼 final.wav / timeline.json / final.srt；takes=1 为 single，明确选择为 selected。
+4. takes 从 2 增为 3 只新增 take 3；改 selected_take 或 pause_after_ms 不发新请求。改 text、prompt、解析后的 voice、speech_rate、字幕开关等 body 内容会改变所有 take 指纹，需重新核对调用与费用。
+5. 调用前落盘 uncertain，异常不自动重发；先核对供应商调用记录、费用与授权，再决定 --retry-uncertain。全部已完成 WAV/字幕缓存先预检，再发任何新请求；完成缓存损坏不是静默重收费的理由。
+
+只有用户已授权且了解尚未验收的听感与音色能力风险，才执行以下**可能收费**流程（不会因为文档示例自动授权）：
+
+```sh
+# skill 目录；PLAN 指向用户作品或仓库 examples/perform/plan.json
+uv run scripts/tts.py preview --plan "$PLAN" --out 阅读稿
+uv run scripts/tts.py render --plan "$PLAN" --out 音频 --dry-run
+# 仅在用户授权后，先局部试听 perform；此命令可能收费
+uv run scripts/tts.py render --plan "$PLAN" --out 音频 --only-mode perform
+# 试听后编辑 selected_take；同目录完整 render 可能需生成未缓存的 TTS
+uv run scripts/tts.py render --plan "$PLAN" --out 音频
+```
+
+`--only-mode {tts,perform}` 只发送指定模式的新请求；被跳过片段若有已完成有效缓存，可以复用它完成全片。**任一跳过片段缺缓存时，不生成 final.wav、timeline.json、final.srt，只交付片段与 take 文件，并在结果说明缺失片段。** 这种不完整渲染会移除该输出目录由脚本管理的旧 final.wav / timeline.json / final.srt，保留已完成片段缓存，避免误交旧成品；完整 render 与首次同角色 A/B 短样仍可能收费，先核对授权范围。
+
+按提供的 API 文档，响应为单个 JSON，audio 是 base64，url 短期有效（文档为 2 小时）；本工具只用 audio，不另下载 url，manifest 不保存 url 本身。目标落盘为 **24 kHz、16-bit、单声道 WAV**，不重采样、不裁剪静音、不做自动响度归一。24 kHz / 位深须校验；返回双声道时逐帧平均下混并记 downmixed=true，其他声道数拒绝。获授权 S_ 样本实际返回双声道，下混结果已核对；不能将一次观察写成接口保证单声道或保证所有音色均相同。
+
+subtitle.sentences 的 start_time / end_time 按提供文档是整数毫秒，转换为现有 words 的片段秒时间，再按实际 PCM 长度加全片偏移导出字幕；本次 S_ 样本的返回结构、毫秒转秒与偏移已核对，不代表所有后续响应或精确口型已验收。字幕不可用时保留音频并标 invalid_subtitles / not_returned，不猜时间或自动重试。timeline 增加 mode、take、take_selection、text_match 与 rms_dbfs（观察音量、不修改音频；数字静音记 null，避免非标准 JSON 的 -Infinity）；manifest 记录 duration、original_duration（计费秒数）、耗时与 logid。
+
+字幕启用时，返回字幕与提交文字作忽略标点的 lexical_text 比较：不一致标 text_match=false，并在结果列 text_mismatch，不报错或重生成；关闭字幕为 null。笑声文字化、加词、漏词均需听审。**text_match=true、timestamps=true、结构检查通过都不证明发音准确、演得好、干声合格或音色一致。**
+
+### dry-run 与费用
+
+render --dry-run 不读密钥、不联网合成，只写本地审阅文件。requests.json 中 TTS 与 perform 请求按片段分别列出，perform.text_prompt 保留完整原样；routes.json 增加 mode、perform 的 model 与 takes。即使 --only-mode 筛选调用范围，requests.json / routes.json 仍保留全计划以便审阅；tts / perform 分类统计只计算符合筛选的片段。下面是仓库示例的离线输出节选（无 only-mode，不是真实合成日志）：
+
+```json
+{
+  "dry_run": true,
+  "tts": {"clips": 1, "characters": 11},
+  "perform": {
+    "clips": 1,
+    "takes": 3,
+    "calls": 3,
+    "characters": 22,
+    "estimated_seconds": 25.8
+  },
+  "perform_cost_note": "按生成时长计费，约 1 元/分钟，以控制台为准",
+  "estimate_note": "秒数仅为提交文本字数 × 0.3 + 2 的每 take 粗估；calls 为不考虑缓存的调用上限"
+}
+```
+
+- clips 是符合 --only-mode 范围的该模式片段数（未指定时为全部）；characters 是实际提交台词的字符数，包含标点，不重复乘 takes，也不计导演 prompt。perform.takes 为该模式各片段 takes 的总和。
+- **calls 是所选模式范围内的调用次数上界，不估计缓存命中，不是实际待收费调用数**；已经生成的相同 take 可能零调用复用，改 selected_take 也不会重发。dry-run 不作缓存费用承诺。
+- estimated_seconds 粗估所有 perform takes 合计：每段 `(提交文本字符数 × 0.3 + 2) × takes` 后求和。示例 `(22 × 0.3 + 2) × 3 = 25.8 秒`；非返回时长、非报价，副语言或静音会改变时长。
+- 费用按真实 original_duration，而不是倍速后的 duration。约 **1 元/分钟**及 **60 分钟/半年试用额度**来自提供的计费资料，价格、试用资格/余量、有效期与开通条件均以当前控制台为准；不能保证免费或低于某个金额。多 take 都计费，不用缓存上界估算保证最终账单。
+
+### 官方依据与上线前待验收项
+
+音频生成 HTTP 官方页面正文已于 2026-10-12 在线复核；其余链接是提供资料中的出处，不冒充逐页实时确认或真实合成证据：
+
+- [音频生成 HTTP API](https://docs.volcengine.com/docs/DoubaoVoice/audio-generation-http?lang=zh)：POST /tts/create、seed-audio-1.0、speaker 参考、audio_config、返回音频与字幕；接口文字 ≤3000 字符、单次最长 120 秒。
+- [模型列表](https://docs.volcengine.com/docs/6561/2499930?lang=zh)、[音频生成产品简介](https://docs.volcengine.com/docs/DoubaoVoice/ProductOverview-9?lang=zh)：副语言与混音能力；新版提供的 API 说明列 18 语言，本地仅接中英。
+- [计费说明](https://docs.volcengine.com/docs/6561/1359370?lang=zh)、[计费概述](https://docs.volcengine.com/docs/6561/1359369?lang=zh)：original_duration 与价格/试用条款，以账号当前控制台为准。
+- [错误码](https://docs.volcengine.com/docs/6561/2534853?lang=zh)：审核、音色和时长错误；即使官方建议重试，本工具仍须人工确认 uncertain 与授权。
+- [TTS HTTP](https://docs.volcengine.com/docs/DoubaoVoice/unidirectional-streaming-text-to-speech-http?lang=zh)、[音色列表](https://docs.volcengine.com/docs/DoubaoVoice/Tonelist-1?lang=zh)：普通预置 2.0 音色优先 direction；不能假定 S_ 复刻支持 TTS context_texts 情绪指令。
+
+**剩余验收：**本轮已核对一个 S_ 样本的无 code 响应兼容、24 kHz/16-bit 双声道下混、字幕结构/毫秒单位、返回时长及与 TTS 的拼接；不再把这些写成完全未实测。尚须在授权范围内用预置 zh_ 做协议短样，并试听已有或另行获准生成的同角色 TTS / perform 样本，核对音色身份/相似度、干声/首尾静音、台词遵循与副语言动作。@音频1 是否真正绑定 speaker 仍未得到听审或对照证据；0 / 20000000 是兼容规则而非本轮观察到的成功码。新调用或重试仍需对应授权，不能因一次协议成功追加调用；离线验收不代替真实接口，真实返回也不代替试听。
 
 ## 逐字时间戳与字幕
 
@@ -101,10 +271,10 @@ WAV 预检按固定块读取全部声明 PCM 验证完整性，缓存只保留�
 
 ## 已有克隆音色
 
-本工具支持使用已训练完成且账号有权限的**声音复刻 2.0** 音色合成，不提供录音上传、音色训练、升级或旧代际接口。`S_` 前缀只用于识别克隆 ID 格式，不能据此断言训练代际；本工具默认选择 `seed-icl-2.0`，不自动试其他收费资源。
+本工具支持使用已训练完成且账号有权限的**声音复刻 2.0** 音色合成，不提供录音上传、音色训练、升级或旧代际接口。`S_` 前缀只用于识别克隆 ID 格式，不能据此断言训练代际；本工具默认选择 `seed-icl-2.0`，不自动试其他收费资源。下方 ID 是占位值，必须替换成自己的实际音色 ID 后使用。
 
 ```sh
-uv run scripts/tts.py prepare --text-file 原稿.txt --voice S_xWSg2NNT1 --resource-id seed-icl-2.0 --out plan.json
+uv run scripts/tts.py prepare --text-file 原稿.txt --voice S_替换成你的复刻音色ID --resource-id seed-icl-2.0 --out plan.json
 # 完成 readings 语境校对后，按常规 preview → dry-run → 已授权 render 流程执行
 ```
 

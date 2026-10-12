@@ -1,4 +1,6 @@
 interface:
-  display_name: "火山中英配音导演"
-  short_description: "中英混读、英文发音表与中文多音字校对，导出火山配音和字词时间戳"
-  default_prompt: "使用 $volce-tts-director 保留这份稿件里的中英文原文，配置品牌、缩写与型号读法，在阅读稿里标出中文多音字和读音，再按我的要求制作配音和字幕。"
+  display_name: "火山引擎TTS导演"
+  short_description: "让台词有情绪、有节奏：中英混读、多音字校对、分角色配音与情绪演绎，导出音频和字幕"
+  icon_small: "./assets/icon.png"
+  icon_large: "./assets/icon.png"
+  default_prompt: "使用 $volce-tts-director 处理这份配音稿，保留中英文原文，先校对多音字和英文读法并展示阅读稿，再按我的音色与演绎要求生成音频和字幕。"

@@ -3,7 +3,7 @@
 # requires-python = ">=3.10"
 # dependencies = ["pypinyin==0.55.0"]
 # ///
-"""中英混读、中文校对、阅读稿和火山 TTS；preview/prepare/dry-run 均不访问网络。"""
+"""中英混读、中文校对、阅读稿与火山 TTS / 情绪演绎；preview/prepare/dry-run 均不访问网络。"""
 import argparse
 import base64
 import hashlib
@@ -13,7 +13,10 @@ import json
 import math
 import os
 import re
+import shutil
+import struct
 import sys
+from datetime import datetime, timedelta, timezone
 import time
 import urllib.error
 import urllib.request
@@ -26,6 +29,10 @@ from pypinyin.contrib.tone_convert import to_tone, to_normal
 from pypinyin.constants import PINYIN_DICT
 
 ENDPOINT = "https://openspeech.bytedance.com/api/v3/tts/unidirectional"
+PERFORM_ENDPOINT = "https://openspeech.bytedance.com/api/v3/tts/create"
+PERFORM_MODEL = "seed-audio-1.0"
+# S_ 请求携带此标记已实测返回音频；音色绑定与听感仍须试听，不自动探测或重试。
+PERFORM_REF_TAG = "@音频1"
 VOICE = "zh_female_vv_uranus_bigtts"
 PRONUNCIATIONS = Path(__file__).resolve().parents[1] / "references/pronunciations.json"
 DIGITS = ("zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine")
@@ -320,8 +327,39 @@ def readings(clip, complete=False, pronunciation_table=None):
     return rows, rules
 
 
+def resolve_voices(plan, voices=None):
+    mapping = {}
+    for source in (plan.get("voices", {}), voices if voices is not None else {}):
+        if not isinstance(source, dict) or any(not isinstance(role, str) or not role.strip()
+                                               for role in source):
+            raise ValueError("voices 须为角色到音色 ID 的对象")
+        mapping.update(source)
+    for voice in mapping.values():
+        resolve_resource({"voice": voice})
+    clips = plan.get("clips")
+    if not isinstance(clips, list) or not clips:
+        raise ValueError("计划需要非空 clips")
+    resolved, missing = [], set()
+    for clip in clips:
+        item = dict(clip)
+        if "voice" not in item:
+            role = item.get("role", "旁白")
+            if not isinstance(role, str) or not role.strip():
+                raise ValueError("role 必须为非空字符串")
+            if role not in mapping:
+                missing.add(role)
+            else:
+                item["voice"] = mapping[role]
+        resolved.append(item)
+    if missing:
+        raise ValueError("缺少角色音色，请在 voices 填写：" + "、".join(sorted(missing)))
+    return {**plan, "voices": mapping, "clips": resolved}
+
+
 def resolve_resource(clip):
     voice = clip["voice"]
+    if isinstance(voice, str) and ("替换" in voice or "你的" in voice):
+        raise ValueError("音色 ID 是占位值，请填写自己的音色")
     if isinstance(voice, str) and re.fullmatch(r"zh_[a-zA-Z0-9_]+", voice):
         expected = "seed-tts-2.0"
     elif isinstance(voice, str) and re.fullmatch(r"S_[a-zA-Z0-9]+", voice):
@@ -342,7 +380,13 @@ def request_fingerprint(body, resource):
     return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 
+def perform_fingerprint(body, take):
+    value = {"endpoint": PERFORM_ENDPOINT, "model": PERFORM_MODEL, "body": body, "take": take}
+    return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
 def validate(plan, complete=False):
+    plan = resolve_voices(plan)
     table = plan.get("pronunciation_table")
     validate_pronunciations(table)
     if "enable_subtitle" in plan and type(plan["enable_subtitle"]) is not bool:
@@ -356,6 +400,11 @@ def validate(plan, complete=False):
         if not isinstance(ident, str) or not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", ident) or ident in ids:
             raise ValueError("片段 id 必须唯一且只包含字母数字下划线短横线")
         ids.add(ident)
+        mode = clip.get("mode", "tts")
+        if mode not in ("tts", "perform"):
+            raise ValueError("mode 只能为 tts 或 perform")
+        if mode == "tts" and "perform" in clip:
+            raise ValueError("perform 配置只允许用于 mode=perform")
         check_text(clip["text"])
         if len(clip["text"]) > 500:
             raise ValueError("单段本地上限 500 字；请明确分段，不截断")
@@ -384,7 +433,10 @@ def validate(plan, complete=False):
             raise ValueError("explicit_language 只能为 zh-cn（中英混读）或 en（英语）")
         if language == "en" and HAN.search(clip["text"]):
             raise ValueError("包含中文的片段须使用 zh-cn 或省略 explicit_language")
-        readings(clip, complete, table)
+        if mode == "perform":
+            perform_body(clip, pronunciation_table=table, complete=complete)
+        else:
+            readings(clip, complete, table)
 
 
 def load_pronunciations(path):
@@ -447,7 +499,8 @@ def prepare(text, voice=VOICE, resource_id=None, pronunciation_table=None):
     return plan
 
 
-def preview(plan, out):
+def preview(plan, out, voices=None):
+    plan = resolve_voices(plan, voices)
     validate(plan)
     out.mkdir(parents=True, exist_ok=True)
     title = str(plan.get("title", "中文阅读"))
@@ -496,6 +549,14 @@ def preview(plan, out):
                     ("英语原生读法", "、".join(sorted(native))),
                     ("英语读音提示（指令，须试听）", "\n".join(hints)),
                     ("混读发音字典（服务端文本转写）", "\n".join(w + "/" + value for w, value in mixed_rules.items()))]
+        if clip.get("mode") == "perform":
+            controls[0] = ("合成模型", PERFORM_MODEL)
+            controls.extend([("情绪演绎提示词（效果须试听）", perform_body(
+                clip, pronunciation_table=plan.get("pronunciation_table"), complete=False)["text_prompt"]),
+                ("take 数量", str(clip["perform"].get("takes", 1))),
+                ("选定 take", str(clip["perform"].get("selected_take") or "未指定；暂用 take 1"))])
+            if clip.get("reference_text"):
+                controls.append(("试听警告", "引用上文有被模型念出的风险；结构检查不能代替试听。"))
         md += ["\n## " + label + "\n", "".join(plain) + "\n"]
         md.extend(name + "：" + value + "\n" for name, value in controls if value)
         md.extend(details)
@@ -561,21 +622,110 @@ def request_body(clip, enable_subtitle=None, pronunciation_table=None):
             "additions": json.dumps(additions, ensure_ascii=False)}}
 
 
+def perform_body(clip, enable_subtitle=None, pronunciation_table=None, complete=True):
+    config = clip.get("perform")
+    if not isinstance(config, dict):
+        raise ValueError("mode=perform 需要 perform 对象")
+    unknown = set(config) - {"prompt", "takes", "selected_take", "ambience"}
+    if unknown:
+        raise ValueError("未知 perform 字段：" + "、".join(sorted(unknown)))
+    prompt = config.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 500:
+        raise ValueError("perform.prompt 须为 1～500 字的导演说明，台词只放 text")
+    takes, selected = config.get("takes", 1), config.get("selected_take")
+    if type(takes) is not int or not 1 <= takes <= 4:
+        raise ValueError("perform.takes 须为 1～4 的整数")
+    if selected is not None and (type(selected) is not int or not 1 <= selected <= takes):
+        raise ValueError("perform.selected_take 须为 null 或 1～takes 的整数")
+    if type(config.get("ambience", False)) is not bool:
+        raise ValueError("perform.ambience 须为布尔值")
+    if len(clip["text"]) > 400:
+        raise ValueError("perform 台词本地上限 400 字，请拆段")
+    if "explicit_language" in clip and clip["explicit_language"] not in ("zh-cn", "en"):
+        raise ValueError("perform 的 explicit_language 只能为 zh-cn 或 en")
+    for name in ("explicit_dialect", "enable_latex_tn", "section_id", "pronunciation_dict"):
+        if name in clip:
+            raise ValueError(f"perform 不支持 {name}；发音请用 spoken_alias / instruction，或保留 TTS")
+    for row in clip.get("readings", []):
+        if row.get("delivery", "spoken_alias" if "spoken_alias" in row else "dictionary") == "dictionary":
+            raise ValueError("perform 不支持 dictionary；请改用 spoken_alias / instruction，或保留 TTS")
+    rows, rules = readings(clip, complete=complete, pronunciation_table=pronunciation_table)
+    if rules:
+        raise ValueError("perform 不支持发音表缩写/型号转写；请改用 spoken_alias / instruction，或保留 TTS")
+    _, hints, _ = table_controls(clip, pronunciation_table)
+    text, instructions = list(clip["text"]), []
+    for row in rows:
+        delivery = row.get("delivery", "spoken_alias" if "spoken_alias" in row else "dictionary")
+        if delivery == "spoken_alias":
+            start = row["start"]
+            text[start:start + len(row["text"])] = row["spoken_alias"]
+        if delivery in ("instruction", "spoken_alias"):
+            target = row.get("spoken_alias", row["text"])
+            instructions.append(f'原文“{row["text"]}”，本次提交的“{target}”读作 {" ".join(row["pinyin"])}。')
+    role = clip.get("role", "旁白")
+    if not isinstance(role, str) or not role.strip():
+        raise ValueError("role 必须为非空字符串")
+    lines = [f'{PERFORM_REF_TAG} 是“{role}”的音色，全程只用这个音色。']
+    if clip.get("direction"):
+        lines.append(f'{role}的整体语气：{clip["direction"]}')
+    if clip.get("reference_text"):
+        lines.append("上文（只用于理解情绪，不要念出来）：" + clip["reference_text"])
+    lines.append(f'{role}（参考 {PERFORM_REF_TAG}）{prompt}：“{"".join(text)}”')
+    if instructions or hints:
+        lines.append("发音要求：" + "\n".join(instructions + hints))
+    if not config.get("ambience", False):
+        lines.append("只生成这一个角色的人声干声，不要背景音乐、环境声或音效，不要添加台词以外的话。")
+    text_prompt = "\n".join(lines)
+    if len(text_prompt) > 3000:
+        raise ValueError("perform 拼接后的 text_prompt 超过 3000 字符，请缩短导演说明或拆段")
+    if enable_subtitle is None:
+        enable_subtitle = clip.get("enable_subtitle", True)
+    if type(enable_subtitle) is not bool:
+        raise ValueError("enable_subtitle 必须为布尔值")
+    return {"model": PERFORM_MODEL, "text_prompt": text_prompt,
+            "references": [{"speaker": clip["voice"]}],
+            "audio_config": {"format": "wav", "sample_rate": 24000,
+                             "speech_rate": clip.get("speech_rate", 0), "enable_subtitle": enable_subtitle}}
+
+
+def subtitle_body(clip, body):
+    # 仅供本地字幕处理复用，不发送到服务端，也不参与请求指纹。
+    if "req_params" in body:
+        return body
+    text = list(clip["text"])
+    for row in clip.get("readings", []):
+        if row.get("spoken_alias"):
+            start = row["start"]
+            text[start:start + len(row["text"])] = row["spoken_alias"]
+    return {"req_params": {"text": "".join(text), "audio_params": body["audio_config"]}}
+
+
 def debug_frame(frame, secret):
+    sensitive = r"key|token|authorization|secret|cookie|password|url"
+    hidden = {secret} if secret else set()
+    def collect(value):
+        if isinstance(value, dict):
+            for name, item in value.items():
+                if (name in ("audio", "data") or re.search(sensitive, name, re.I)) and isinstance(item, str) and item:
+                    hidden.add(item)
+                collect(item)
+        elif isinstance(value, list):
+            for item in value:
+                collect(item)
+    collect(frame)
+    hidden = sorted(hidden, key=len, reverse=True)
     def redact(value):
         if isinstance(value, dict):
-            return {redact(name): ("[REDACTED]" if re.search(
-                r"key|token|authorization|secret|cookie|password", name, re.I) else redact(item))
-                for name, item in value.items()}
+            return {redact(name): ("[REDACTED]" if re.search(sensitive, name, re.I) else
+                f"[base64: {len(item)} characters]" if name in ("audio", "data") and isinstance(item, str)
+                else redact(item)) for name, item in value.items()}
         if isinstance(value, list):
             return [redact(item) for item in value]
         if isinstance(value, str):
-            return value.replace(secret, "[REDACTED]") if secret else value
+            for item in hidden:
+                value = value.replace(item, "[REDACTED]")
         return value
-    safe = dict(frame)
-    if isinstance(safe.get("data"), str):
-        safe["data"] = f"[base64: {len(safe['data'])} characters]"
-    print("stream_frame: " + json.dumps(redact(safe), ensure_ascii=False), file=sys.stderr)
+    print("stream_frame: " + json.dumps(redact(frame), ensure_ascii=False), file=sys.stderr)
 
 
 def decode_stream(lines, debug=None):
@@ -602,6 +752,95 @@ def decode_stream(lines, debug=None):
     if not finished or not audio or len(audio) % 2:
         raise RuntimeError("音频流未完整结束或 PCM 数据无效")
     return bytes(audio), usage, subtitles
+
+
+def record_perform_error(entry, payload, key):
+    if not isinstance(payload, dict):
+        return
+    if type(payload.get("code")) is int:
+        entry["error_code"] = payload["code"]
+    message = payload.get("message")
+    if isinstance(message, str):
+        for secret in (key, payload.get("audio"), payload.get("url")):
+            if isinstance(secret, str) and secret:
+                message = message.replace(secret, "[REDACTED]")
+        entry["error_message"] = message[:2000]
+
+
+def decode_perform(payload):
+    # 2026-10-12 真实响应与官方示例均可省略 code；出现时仍严格校验。
+    code = payload.get("code", 0) if isinstance(payload, dict) else None
+    if type(code) is not int or code not in (0, 20000000):
+        raise ValueError("音频生成返回失败或无效状态码")
+    audio = payload.get("audio")
+    if not isinstance(audio, str) or not audio:
+        raise ValueError("音频生成响应缺少 audio")
+    raw = base64.b64decode(audio, validate=True)
+    with wave.open(io.BytesIO(raw), "rb") as wav:
+        channels = wav.getnchannels()
+        if wav.getframerate() != 24000 or wav.getsampwidth() != 2 or channels not in (1, 2):
+            raise ValueError("perform 必须返回 24000 Hz、16 bit、单声道或双声道 WAV")
+        frames = wav.getnframes()
+        pcm = wav.readframes(frames)
+        if frames <= 0 or len(pcm) != frames * channels * 2:
+            raise ValueError("perform WAV 为空或不完整")
+    if channels == 2:
+        mono = bytearray(frames * 2)
+        for i, (left, right) in enumerate(struct.iter_unpack("<hh", pcm)):
+            struct.pack_into("<h", mono, i * 2, int((left + right) / 2))
+        pcm = bytes(mono)
+    return pcm, channels == 2
+
+
+def perform_subtitles(clip, body, payload, duration):
+    adapted = subtitle_body(clip, body)
+    if not body["audio_config"]["enable_subtitle"]:
+        data, reason = clip_subtitles(clip, adapted, [], duration)
+        return data, reason, None
+    subtitle = payload.get("subtitle")
+    if subtitle is None:
+        data, reason = clip_subtitles(clip, adapted, [], duration)
+        return data, reason, None
+    text_match = None
+    try:
+        if not isinstance(subtitle, dict):
+            raise ValueError("字幕对象无效")
+        if isinstance(subtitle.get("text"), str):
+            text_match = lexical_text(subtitle["text"]) == lexical_text(adapted["req_params"]["text"])
+        sentences = subtitle.get("sentences")
+        if not isinstance(sentences, list):
+            raise ValueError("字幕 sentences 无效")
+        if any(not isinstance(sentence, dict) or not isinstance(sentence.get("text"), str)
+               for sentence in sentences):
+            raise ValueError("字幕句子无效")
+        if sentences:
+            sentence_match = lexical_text("".join(s["text"] for s in sentences)) == lexical_text(adapted["req_params"]["text"])
+            text_match = sentence_match if text_match is None else text_match and sentence_match
+        events = []
+        for sentence in sentences:
+            start, end = sentence.get("start_time"), sentence.get("end_time")
+            if (type(start) is not int or type(end) is not int
+                    or not valid_subtitle_span(start / 1000, end / 1000, duration)):
+                raise ValueError("字幕句子毫秒时间无效")
+            raw_words = sentence.get("words")
+            if not isinstance(raw_words, list):
+                raise ValueError("字幕 words 无效")
+            words = []
+            for word in raw_words:
+                if not isinstance(word, dict):
+                    raise ValueError("字幕字词无效")
+                left, right = word.get("start_time"), word.get("end_time")
+                if (type(left) is not int or type(right) is not int or not start <= left <= right <= end):
+                    raise ValueError("字幕字词毫秒时间无效")
+                words.append({"word": word.get("text"), "startTime": left / 1000, "endTime": right / 1000})
+            events.append({"text": sentence["text"], "words": words})
+        data, reason = clip_subtitles(clip, adapted, events, duration)
+        if data["words"] and lexical_text(data["text"]) != lexical_text(adapted["req_params"]["text"]):
+            text_match = False
+    except (ValueError, OverflowError):
+        data = {"text": adapted["req_params"]["text"], "words": [], "sentences": []}
+        reason = "invalid_subtitles"
+    return data, reason, text_match
 
 
 def finite_number(value):
@@ -857,7 +1096,10 @@ def build_timeline(segments):
         clips.append({"id": clip["id"], "text": clip["text"], "subtitle_text": data["text"],
                       "offset": offset, "duration": duration, "pause_after_ms": pause,
                       "audio": segment["audio"], "words_file": segment["words_file"],
-                      "timestamps": bool(data["words"]), "timestamps_reason": segment["timestamps_reason"]})
+                      "timestamps": bool(data["words"]), "timestamps_reason": segment["timestamps_reason"],
+                      "mode": clip.get("mode", "tts"), "take": segment.get("take", 1),
+                      "take_selection": segment.get("take_selection", "single"),
+                      "text_match": segment.get("text_match"), "rms_dbfs": segment.get("rms_dbfs")})
         for name, target in (("words", words), ("sentences", sentences)):
             for item in data[name]:
                 target.append({**item, "clip": clip["id"],
@@ -919,6 +1161,16 @@ def inspect_cached_wav(path):
     return frames
 
 
+def rms_dbfs(path):
+    total = 0
+    with wave.open(str(path), "rb") as wav:
+        frames = wav_frames(wav)
+        for chunk in pcm_chunks(wav, frames):
+            total += sum(sample * sample for (sample,) in struct.iter_unpack("<h", chunk))
+    # 数字静音没有有限 dBFS 值；JSON 用 null，不写非标准的 -Infinity。
+    return round(10 * math.log10(total / frames / (32768 ** 2)), 3) if total else None
+
+
 def write_pcm_wav(path, pcm):
     temp = path.with_suffix(".tmp")
     with wave.open(str(temp), "wb") as wav:
@@ -977,47 +1229,81 @@ def read_cached_clip(clip, body, out, fingerprint, entry, sidecar_updates=None):
                            "请核对费用与授权后使用新的输出目录；未自动重发") from None
 
 
-def render(plan, out, dry_run=False, retry_uncertain=False, timestamps=None, debug_stream=False):
+def render(plan, out, dry_run=False, retry_uncertain=False, timestamps=None, debug_stream=False,
+           voices=None, only_mode=None):
+    plan = resolve_voices(plan, voices)
     validate(plan, complete=True)
     if timestamps is not None and type(timestamps) is not bool:
         raise ValueError("timestamps 必须为布尔值")
-    jobs = [(clip, request_body(clip, timestamps if timestamps is not None else
-             clip.get("enable_subtitle", plan.get("enable_subtitle", True)), plan.get("pronunciation_table")), resolve_resource(clip))
-            for clip in plan["clips"]]
-    routes = [{"clip": clip["id"], "speaker": clip["voice"], "resource_id": resource,
-               "endpoint": ENDPOINT} for clip, _, resource in jobs]
+    if only_mode not in (None, "tts", "perform"):
+        raise ValueError("only_mode 只能为 tts 或 perform")
+    jobs, attempts = [], []
+    for clip in plan["clips"]:
+        mode = clip.get("mode", "tts")
+        enabled = timestamps if timestamps is not None else clip.get("enable_subtitle", plan.get("enable_subtitle", True))
+        builder = perform_body if mode == "perform" else request_body
+        body = builder(clip, enabled, plan.get("pronunciation_table"))
+        route = {"mode": mode, "endpoint": PERFORM_ENDPOINT if mode == "perform" else ENDPOINT,
+                 "takes": clip["perform"].get("takes", 1) if mode == "perform" else 1}
+        route.update({"model": PERFORM_MODEL} if mode == "perform" else {"resource_id": resolve_resource(clip)})
+        jobs.append((clip, body, route))
+        for take in range(1, route["takes"] + 1):
+            fingerprint = (perform_fingerprint(body, take) if mode == "perform" else
+                           request_fingerprint(body, route["resource_id"]))
+            attempts.append((clip, body, route, take, fingerprint))
+    routes = [{"clip": clip["id"], "speaker": clip["voice"], **route} for clip, _, route in jobs]
     out.mkdir(parents=True, exist_ok=True)
     save(out / "requests.json", [body for _, body, _ in jobs])
     save(out / "routes.json", routes)
     if dry_run:
+        counts = {"tts": {"clips": 0, "characters": 0},
+                  "perform": {"clips": 0, "takes": 0, "calls": 0, "characters": 0, "estimated_seconds": 0}}
+        for clip, body, route in jobs:
+            if only_mode is not None and route["mode"] != only_mode:
+                continue
+            count = counts[route["mode"]]
+            characters = len(subtitle_body(clip, body)["req_params"]["text"])
+            count["clips"] += 1
+            count["characters"] += characters
+            if route["mode"] == "perform":
+                count["takes"] += route["takes"]
+                count["calls"] += route["takes"]
+                count["estimated_seconds"] += (characters * 0.3 + 2) * route["takes"]
+        counts["perform"]["estimated_seconds"] = round(counts["perform"]["estimated_seconds"], 3)
         return {"dry_run": True, "clips": len(jobs),
-                "characters": sum(len(c["text"]) for c, _, _ in jobs), "routes": routes}
+                "characters": sum(len(c["text"]) for c, _, _ in jobs), "routes": routes, **counts,
+                "perform_cost_note": "按生成时长计费，约 1 元/分钟，以控制台为准",
+                "estimate_note": "秒数仅为提交文本字数 × 0.3 + 2 的每 take 粗估；calls 为不考虑缓存的调用上限"}
     key = os.environ.get("VOLC_TTS_API_KEY")
     if not key:
         raise ValueError("运行环境缺少 VOLC_TTS_API_KEY")
     manifest_path = out / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
-    fingerprints = [request_fingerprint(body, resource) for _, body, resource in jobs]
     cached_clips, sidecar_updates, manifest_dirty = {}, {}, False
-    for (clip, body, resource), fingerprint in zip(jobs, fingerprints):
-        legacy_body = json.loads(json.dumps(body))
-        del legacy_body["req_params"]["audio_params"]["enable_subtitle"]
-        legacy = request_fingerprint(legacy_body, resource)
-        if resource != "seed-tts-2.0" and any(request_fingerprint(b, "seed-tts-2.0") in manifest
-                                            for b in (body, legacy_body)):
-            raise RuntimeError("已有未绑定资源的旧克隆请求记录；请先核对服务记录，不自动复用或重发")
+    for clip, body, route, take, fingerprint in attempts:
         entry = manifest.get(fingerprint, {})
-        old = manifest.get(legacy, {}) if entry.get("status") != "complete" else {}
-        if not retry_uncertain and any(e.get("status") == "uncertain" for e in (entry, old)):
+        old, legacy = {}, fingerprint
+        eligible = only_mode is None or route["mode"] == only_mode
+        if route["mode"] == "tts":
+            resource = route["resource_id"]
+            legacy_body = json.loads(json.dumps(body))
+            del legacy_body["req_params"]["audio_params"]["enable_subtitle"]
+            legacy = request_fingerprint(legacy_body, resource)
+            if resource != "seed-tts-2.0" and any(request_fingerprint(b, "seed-tts-2.0") in manifest
+                                                for b in (body, legacy_body)):
+                raise RuntimeError("已有未绑定资源的旧克隆请求记录；请先核对服务记录，不自动复用或重发")
+            old = manifest.get(legacy, {}) if entry.get("status") != "complete" else {}
+        if eligible and not retry_uncertain and any(e.get("status") == "uncertain" for e in (entry, old)):
             raise RuntimeError("已有结果不确定的请求；核对服务记录与授权后才能 --retry-uncertain")
-        if body["req_params"]["audio_params"]["enable_subtitle"]:
+        adapted = subtitle_body(clip, body)
+        if adapted["req_params"]["audio_params"]["enable_subtitle"]:
             for cached, record in ((fingerprint, entry), (legacy, old)):
                 if record.get("status") == "complete" and not (out / (cached + ".words.json")).is_file():
                     raise RuntimeError(f"片段 {clip['id']} 已有音频缓存但缺少 words.json；需要重新渲染以获取时间戳。"
                                        "请核对费用与授权后使用新的输出目录；未自动重发")
         if entry.get("status") == "complete" and fingerprint not in cached_clips:
-            # 在任何新调用前校验全部完成缓存，不能先收费再发现后段缓存损坏。
-            cached_clips[fingerprint] = read_cached_clip(clip, body, out, fingerprint, entry, sidecar_updates)
+            # 包含所有 perform take 和跳过模式的缓存；任何新调用前统一校验。
+            cached_clips[fingerprint] = read_cached_clip(clip, adapted, out, fingerprint, entry, sidecar_updates)
             frames, data, reason = cached_clips[fingerprint]
             metadata = {"words_file": fingerprint + ".words.json", "timestamps": bool(data["words"]),
                         "timestamps_reason": reason}
@@ -1026,47 +1312,122 @@ def render(plan, out, dry_run=False, retry_uncertain=False, timestamps=None, deb
                 manifest_dirty = True
     for path, data in sidecar_updates.items():
         save(path, data)
-    segments = []
-    for (clip, body, resource), fingerprint in zip(jobs, fingerprints):
+    segments, takes_index, missing, pending, mismatches = [], {}, [], [], []
+    for clip, body, route, take, fingerprint in attempts:
+        mode = route["mode"]
         audio_path = out / (fingerprint + ".wav")
         words_path = out / (fingerprint + ".words.json")
         entry = manifest.get(fingerprint, {})
         if entry.get("status") == "complete":
             frames, data, reason = cached_clips[fingerprint]
+        elif only_mode is not None and mode != only_mode:
+            selected = clip.get("perform", {}).get("selected_take") or 1
+            if take == selected:
+                missing.append(clip["id"])
+            continue
         else:
             request_id = str(uuid.uuid4())
             entry = {"status": "uncertain", "request_id": request_id, "clip": clip["id"],
-                     "resource_id": resource, "endpoint": ENDPOINT}
+                     **route, "take": take}
             manifest[fingerprint] = entry
             save(manifest_path, manifest)
             manifest_dirty = False
-            request = urllib.request.Request(ENDPOINT, data=json.dumps(body, ensure_ascii=False).encode(),
-                headers={"Content-Type": "application/json", "X-Api-Key": key,
-                         "X-Api-Resource-Id": resource, "X-Api-Request-Id": request_id}, method="POST")
+            headers = {"Content-Type": "application/json", "X-Api-Key": key, "X-Api-Request-Id": request_id}
+            if mode == "tts":
+                headers["X-Api-Resource-Id"] = route["resource_id"]
+            request = urllib.request.Request(route["endpoint"], data=json.dumps(body, ensure_ascii=False).encode(),
+                                             headers=headers, method="POST")
             started = time.monotonic()
             try:
                 # 不跟随重定向，避免凭据转发到另一目的地。
                 opener = urllib.request.build_opener(NoRedirect)
-                with opener.open(request, timeout=90) as response:
-                    entry["logid"] = response.headers.get("X-Tt-Logid")
-                    pcm, usage, events = decode_stream(response, (lambda frame: debug_frame(frame, key)) if debug_stream else None)
-                frames = len(pcm) // 2
-                data, reason = clip_subtitles(clip, body, events, frames / 24000)
+                with opener.open(request, timeout=300 if mode == "perform" else 90) as response:
+                    logid = response.headers.get("X-Tt-Logid")
+                    entry["logid"] = logid.replace(key, "[REDACTED]") if isinstance(logid, str) else None
+                    if mode == "perform":
+                        entry["http_status"] = getattr(response, "status", 200)
+                        payload = json.load(response)
+                        if debug_stream:
+                            debug_frame(payload, key)
+                        if isinstance(payload, dict):
+                            entry["response_code_present"] = "code" in payload
+                            entry["response_code"] = payload.get("code") if type(payload.get("code")) is int else None
+                            for name in ("duration", "original_duration"):
+                                value = payload.get(name)
+                                entry[name] = value if finite_number(value) and value >= 0 else None
+                        if entry["http_status"] != 200:
+                            record_perform_error(entry, payload, key)
+                            raise ValueError("音频生成返回非成功 HTTP 状态")
+                        try:
+                            pcm, downmixed = decode_perform(payload)
+                        except (ValueError, wave.Error, EOFError):
+                            record_perform_error(entry, payload, key)
+                            raise
+                        frames = len(pcm) // 2
+                        data, reason, text_match = perform_subtitles(clip, body, payload, frames / 24000)
+                        entry.update(downmixed=downmixed, text_match=text_match)
+                        if payload.get("url"):
+                            entry["url_expire"] = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()
+                    else:
+                        pcm, usage, events = decode_stream(response, (lambda frame: debug_frame(frame, key)) if debug_stream else None)
+                        frames = len(pcm) // 2
+                        data, reason = clip_subtitles(clip, body, events, frames / 24000)
+                        entry["usage"] = usage
                 write_pcm_wav(audio_path, pcm)
                 del pcm
                 save(words_path, data)
-                entry.update(status="complete", usage=usage, seconds=round(time.monotonic() - started, 3),
+                entry.update(status="complete", seconds=round(time.monotonic() - started, 3),
                              words_file=words_path.name, timestamps=bool(data["words"]), timestamps_reason=reason)
                 save(manifest_path, manifest)
             except Exception as exc:
+                if mode == "perform" and isinstance(exc, urllib.error.HTTPError):
+                    try:
+                        with exc:
+                            logid = exc.headers.get("X-Tt-Logid") if exc.headers else None
+                            entry["logid"] = logid.replace(key, "[REDACTED]") if isinstance(logid, str) else None
+                            payload = json.load(exc)
+                            record_perform_error(entry, payload, key)
+                            if debug_stream:
+                                debug_frame(payload, key)
+                    except (ValueError, OSError):
+                        pass
                 entry.update(status="uncertain", error_type=type(exc).__name__, seconds=round(time.monotonic() - started, 3))
                 save(manifest_path, manifest)
-                raise RuntimeError(f"片段 {clip['id']} 结果不确定（{type(exc).__name__}）；未自动重试") from None
+                raise RuntimeError(f"片段 {clip['id']} take {take} 结果不确定（{type(exc).__name__}）；未自动重试") from None
         cached_clips[fingerprint] = (frames, data, reason)
-        segments.append({"clip": clip, "frames": frames, "audio": audio_path.name,
-                         "words_file": words_path.name, "subtitles": data, "timestamps_reason": reason})
+        selected = clip.get("perform", {}).get("selected_take") or 1
+        if mode == "perform":
+            alias = out / "takes" / f"{clip['id']}-take{take}.wav"
+            alias.parent.mkdir(parents=True, exist_ok=True)
+            temporary = alias.with_suffix(".tmp")
+            shutil.copyfile(audio_path, temporary)
+            temporary.replace(alias)
+            takes_index.setdefault(clip["id"], []).append({
+                "take": take, "fingerprint": fingerprint, "file": str(alias.relative_to(out)),
+                "original_duration": entry.get("original_duration"), "text_match": entry.get("text_match")})
+            if entry.get("text_match") is False:
+                mismatches.append({"clip": clip["id"], "take": take})
+        if take == selected:
+            selection = "single" if route["takes"] == 1 else (
+                "selected" if clip["perform"].get("selected_take") is not None else "provisional")
+            if selection == "provisional":
+                pending.append(clip["id"])
+            segments.append({"clip": clip, "frames": frames, "audio": audio_path.name,
+                             "words_file": words_path.name, "subtitles": data, "timestamps_reason": reason,
+                             "take": take, "take_selection": selection, "text_match": entry.get("text_match"),
+                             "rms_dbfs": rms_dbfs(audio_path)})
     if manifest_dirty:
         save(manifest_path, manifest)
+    save(out / "takes.json", takes_index)
+    result = {"clips": len(jobs), "pending_selection": pending, "text_mismatch": mismatches}
+    if missing:
+        # 不交付缺段或上次计划残留的 final，单段缓存和试听文件仍保留。
+        for name in ("final.wav", "final.srt", "timeline.json"):
+            path = out / name
+            if path.is_file():
+                path.unlink()
+        return {**result, "audio": None, "timeline": None, "srt": None, "timestamps": False,
+                "missing_clips": missing, "note": "跳过模式有片段缺少完成缓存；仅交付各段文件，不拼接 final"}
     final = out / "final.wav"
     concatenate_wavs(segments, final)
     timeline = build_timeline(segments)
@@ -1075,7 +1436,7 @@ def render(plan, out, dry_run=False, retry_uncertain=False, timestamps=None, deb
     temp = srt.with_suffix(".tmp")
     temp.write_text(srt_text(timeline), encoding="utf-8")
     temp.replace(srt)
-    return {"audio": str(final.resolve()), "clips": len(jobs), "timestamps": timeline["timestamps"],
+    return {**result, "audio": str(final.resolve()), "timestamps": timeline["timestamps"],
             "timeline": str((out / "timeline.json").resolve()), "srt": str(srt.resolve())}
 
 
@@ -1098,7 +1459,9 @@ def main():
         cmd = sub.add_parser(command)
         cmd.add_argument("--plan", type=Path, required=True)
         cmd.add_argument("--out", type=Path, required=True)
+        cmd.add_argument("--voices", type=Path, help="角色→音色 JSON；按角色覆盖计划 voices，clip 显式 voice 优先")
         if command == "render":
+            cmd.add_argument("--only-mode", choices=("tts", "perform"), help="只调用指定模式；其余片段须有缓存才能拼接完整 final")
             cmd.add_argument("--dry-run", action="store_true")
             cmd.add_argument("--retry-uncertain", action="store_true")
             cmd.add_argument("--timestamps", action=argparse.BooleanOptionalAction, default=None,
@@ -1114,11 +1477,15 @@ def main():
             result = {"plan": str(args.out.resolve())}
         else:
             plan = json.loads(args.plan.read_text(encoding="utf-8"))
+            voices = json.loads(args.voices.read_text(encoding="utf-8")) if args.voices else None
+            if args.voices and not isinstance(voices, dict):
+                raise ValueError("voices 文件须为角色到音色 ID 的对象")
             if args.command == "preview":
-                preview(plan, args.out)
+                preview(plan, args.out, voices=voices)
                 result = {"preview": str((args.out / "director.html").resolve())}
             else:
-                result = render(plan, args.out, args.dry_run, args.retry_uncertain, args.timestamps, args.debug_stream)
+                result = render(plan, args.out, args.dry_run, args.retry_uncertain, args.timestamps, args.debug_stream,
+                                voices=voices, only_mode=args.only_mode)
         print(json.dumps(result, ensure_ascii=False))
     except (ValueError, RuntimeError, OSError, KeyError, TypeError) as exc:
         print(f"错误：{exc}", file=sys.stderr)
